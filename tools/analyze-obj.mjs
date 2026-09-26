@@ -1,15 +1,15 @@
 /**
- * Фаза 0 — анализатор OBJ.
- * Отвечает на вопрос: можно ли конвертировать модель в кубы без потерь?
+ * Phase 0 — the OBJ analyser.
+ * Answers the question: can the model be converted to cubes without loss?
  *
- * Запуск: node tools/analyze-obj.mjs model/model.obj
+ * Run: node tools/analyze-obj.mjs model/model.obj
  */
 import fs from 'node:fs';
 
 const EPS = 1e-5;
 const file = process.argv[2] ?? 'model/model.obj';
 
-// ---------- парсинг ----------
+// ---------- parsing ----------
 const positions = [];   // [x,y,z]
 const uvs = [];         // [u,v]
 const normalsList = []; // [x,y,z]
@@ -36,7 +36,7 @@ for (const raw of fs.readFileSync(file, 'utf8').split('\n')) {
 			break;
 		case 'f': {
 			if (!current) { current = { name: '<unnamed>', tris: [] }; objects.push(current); }
-			// поддерживаем только треугольники и квады
+			// only triangles and quads are supported
 			const corners = parts.slice(1).map(tok => {
 				const [v, t, nn] = tok.split('/');
 				return [+v - 1, t ? +t - 1 : -1, nn ? +nn - 1 : -1];
@@ -49,7 +49,7 @@ for (const raw of fs.readFileSync(file, 'utf8').split('\n')) {
 	}
 }
 
-// ---------- вектора ----------
+// ---------- vectors ----------
 const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
 const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
 const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
@@ -57,7 +57,7 @@ const len = a => Math.hypot(a[0], a[1], a[2]);
 const norm = a => { const l = len(a); return l < EPS ? [0, 0, 0] : [a[0] / l, a[1] / l, a[2] / l]; };
 const key = a => a.map(n => (Math.abs(n) < EPS ? 0 : n).toFixed(5)).join(',');
 
-// ---------- анализ одного объекта ----------
+// ---------- analysis of a single object ----------
 function analyze(obj) {
 	const idx = new Set();
 	for (const tri of obj.tris) for (const [vi] of tri) idx.add(vi);
@@ -66,14 +66,14 @@ function analyze(obj) {
 	for (const i of idx) uniq.set(key(positions[i]), positions[i]);
 	const pts = [...uniq.values()];
 
-	// нормали берём из самого OBJ — вычисленные через cross вырождаются на тонких гранях
+	// normals are taken from the OBJ itself — computed through cross they degenerate on thin faces
 	const normals = new Map();
 	for (const tri of obj.tris) for (const [, , ni] of tri) {
 		if (ni >= 0) { const n = norm(normalsList[ni]); if (len(n) > 0.5) normals.set(key(n), n); }
 	}
 	const ns = [...normals.values()];
 
-	// три ортогональные оси из нормалей (игнорируя знак)
+	// three orthogonal axes from the normals (ignoring sign)
 	const axes = [];
 	for (const n of ns) {
 		if (!axes.some(a => Math.abs(Math.abs(dot(a, n)) - 1) < 1e-3)) axes.push(n);
@@ -84,8 +84,8 @@ function analyze(obj) {
 		Math.abs(dot(axes[1], axes[2])) < 1e-3 &&
 		Math.abs(dot(axes[0], axes[2])) < 1e-3;
 
-	// размеры вдоль осей + проверка что это реально ящик:
-	// каждая вершина должна лежать в углу — её проекция на каждую ось равна min либо max
+	// sizes along the axes + a check that it really is a box:
+	// every vertex must lie in a corner — its projection on each axis equals min or max
 	let size = null, isBox = false, degenerate = false;
 	if (orthogonal) {
 		const ranges = axes.map(a => {
@@ -94,7 +94,7 @@ function analyze(obj) {
 		});
 		size = ranges.map(([lo, hi]) => hi - lo);
 		const scale = Math.max(...size, EPS);
-		const tol = scale * 1e-4;            // относительный допуск
+		const tol = scale * 1e-4;            // relative tolerance
 		degenerate = size.some(s => s < scale * 1e-3);
 		isBox = pts.length === 8 && pts.every(p =>
 			axes.every((a, i) => {
@@ -109,8 +109,8 @@ function analyze(obj) {
 		a.filter(c => Math.abs(c) < 1e-3).length === 2
 	);
 
-	// UV: сколько квадов имеют осевой прямоугольник в UV-пространстве
-	// собираем треугольники в квады по нормали
+	// UV: how many quads have an axis-aligned rectangle in UV space
+	// triangles are gathered into quads by normal
 	const byNormal = new Map();
 	for (const tri of obj.tris) {
 		const ni = tri[0][2];
@@ -123,7 +123,7 @@ function analyze(obj) {
 	let uvRect = 0, uvTotal = 0, uvMissing = 0, uvSkewed = 0, faceDegen = 0;
 	const modelScale = Math.max(...(size ?? [1]), EPS);
 	for (const [, tris] of byNormal) {
-		// площадь грани в 3D — вырожденные (у плоских панелей) не рендерятся, их можно выбросить
+		// face area in 3D — degenerate ones (on flat panels) are not rendered and can be dropped
 		const area = tris.reduce((s, tri) =>
 			s + len(cross(sub(positions[tri[1][0]], positions[tri[0][0]]), sub(positions[tri[2][0]], positions[tri[0][0]]))) / 2, 0);
 		if (area < modelScale * modelScale * 1e-6) { faceDegen++; continue; }
@@ -137,7 +137,7 @@ function analyze(obj) {
 			vs.add(uvs[ti][1].toFixed(5));
 		}
 		if (missing) { uvMissing++; continue; }
-		// осевой прямоугольник (в т.ч. повёрнутый на 90/180/270) даёт ровно 2 u и 2 v
+		// an axis-aligned rectangle (including one rotated by 90/180/270) gives exactly 2 u and 2 v
 		if (us.size <= 2 && vs.size <= 2) uvRect++;
 		else uvSkewed++;
 	}
@@ -147,7 +147,7 @@ function analyze(obj) {
 
 const results = objects.map(analyze);
 
-// ---------- отчёт ----------
+// ---------- report ----------
 const n = results.length;
 const boxes = results.filter(r => r.isBox && !r.degenerate);
 const flats = results.filter(r => r.isBox && r.degenerate);
@@ -157,23 +157,23 @@ const rotated = results.filter(r => r.orthogonal && !r.axisAligned);
 
 const pct = k => `${((k / n) * 100).toFixed(1)}%`;
 
-console.log(`\n=== ГЕОМЕТРИЯ (${n} объектов) ===`);
-console.log(`  идеальные ящики      : ${boxes.length}  (${pct(boxes.length)})`);
-console.log(`  плоские (нулевая ось): ${flats.length}  (${pct(flats.length)})`);
-console.log(`  НЕ ящики             : ${other.length}  (${pct(other.length)})`);
-console.log(`  из них по осям (AABB): ${aligned.length}  (${pct(aligned.length)})`);
-console.log(`  повёрнутые (OBB)     : ${rotated.length}  (${pct(rotated.length)})`);
+console.log(`\n=== GEOMETRY (${n} objects) ===`);
+console.log(`  perfect boxes        : ${boxes.length}  (${pct(boxes.length)})`);
+console.log(`  flat (zero axis)     : ${flats.length}  (${pct(flats.length)})`);
+console.log(`  NOT boxes            : ${other.length}  (${pct(other.length)})`);
+console.log(`  axis-aligned (AABB)  : ${aligned.length}  (${pct(aligned.length)})`);
+console.log(`  rotated (OBB)        : ${rotated.length}  (${pct(rotated.length)})`);
 
 if (other.length) {
-	console.log(`\n  примеры не-ящиков:`);
+	console.log(`\n  examples of not-boxes:`);
 	for (const r of other.slice(0, 10)) {
-		console.log(`    ${r.name}: ${r.verts} верт, ${r.faces} граней, ортогональ=${r.orthogonal}`);
+		console.log(`    ${r.name}: ${r.verts} verts, ${r.faces} faces, orthogonal=${r.orthogonal}`);
 	}
 }
 
-// углы поворота повёрнутых
+// rotation angles of the rotated ones
 if (rotated.length) {
-	console.log(`\n=== ПОВОРОТЫ (${rotated.length}) ===`);
+	console.log(`\n=== ROTATIONS (${rotated.length}) ===`);
 	const angles = new Map();
 	for (const r of rotated) {
 		for (const a of r.axes) {
@@ -183,7 +183,7 @@ if (rotated.length) {
 			}
 		}
 	}
-	console.log(`  встречающиеся углы к осям:`, [...angles.keys()].slice(0, 20).join(' '));
+	console.log(`  angles to the axes found:`, [...angles.keys()].slice(0, 20).join(' '));
 }
 
 // UV
@@ -191,38 +191,38 @@ const uvRect = results.reduce((s, r) => s + r.uvRect, 0);
 const uvTotal = results.reduce((s, r) => s + r.uvTotal, 0);
 const uvMissing = results.reduce((s, r) => s + r.uvMissing, 0);
 const faceDegen = results.reduce((s, r) => s + r.faceDegen, 0);
-console.log(`\n=== UV (${uvTotal} видимых граней; ${faceDegen} вырожденных отброшено) ===`);
-console.log(`  осевой прямоугольник : ${uvRect}  (${((uvRect / uvTotal) * 100).toFixed(1)}%)  -> переносится 1:1`);
-console.log(`  без UV               : ${uvMissing}`);
-console.log(`  кривые/скошенные     : ${uvTotal - uvRect - uvMissing}  -> потребуют запекания`);
+console.log(`\n=== UV (${uvTotal} visible faces; ${faceDegen} degenerate dropped) ===`);
+console.log(`  axis-aligned rect    : ${uvRect}  (${((uvRect / uvTotal) * 100).toFixed(1)}%)  -> carried over 1:1`);
+console.log(`  no UV                : ${uvMissing}`);
+console.log(`  curved/skewed        : ${uvTotal - uvRect - uvMissing}  -> will need baking`);
 
-// грани на объект
+// faces per object
 const faceHist = new Map();
 for (const r of results) faceHist.set(r.faces, (faceHist.get(r.faces) ?? 0) + 1);
-console.log(`\n  граней на объект:`, [...faceHist.entries()].sort((a, b) => b[0] - a[0]).map(([f, c]) => `${f}гр×${c}`).join('  '));
+console.log(`\n  faces per object:`, [...faceHist.entries()].sort((a, b) => b[0] - a[0]).map(([f, c]) => `${f}f×${c}`).join('  '));
 
-// габариты и масштаб
+// bounds and scale
 let min = [Infinity, Infinity, Infinity], max = [-Infinity, -Infinity, -Infinity];
 for (const p of positions) for (let i = 0; i < 3; i++) { min[i] = Math.min(min[i], p[i]); max[i] = Math.max(max[i], p[i]); }
-console.log(`\n=== ГАБАРИТЫ ===`);
+console.log(`\n=== BOUNDS ===`);
 console.log(`  min: ${min.map(v => v.toFixed(4)).join(', ')}`);
 console.log(`  max: ${max.map(v => v.toFixed(4)).join(', ')}`);
-console.log(`  размер (ед.): ${max.map((v, i) => (v - min[i]).toFixed(4)).join(' x ')}`);
-console.log(`  размер (×16 = пиксели MC): ${max.map((v, i) => ((v - min[i]) * 16).toFixed(2)).join(' x ')}`);
+console.log(`  size (units): ${max.map((v, i) => (v - min[i]).toFixed(4)).join(' x ')}`);
+console.log(`  size (×16 = MC pixels): ${max.map((v, i) => ((v - min[i]) * 16).toFixed(2)).join(' x ')}`);
 
-// сетка: попадают ли координаты на пиксельную сетку
+// grid: do the coordinates fall on the pixel grid
 const gridHits = { p16: 0, p1: 0, total: 0 };
 for (const p of positions) for (const c of p) {
 	gridHits.total++;
 	if (Math.abs(c * 16 - Math.round(c * 16)) < 1e-4) gridHits.p16++;
 	if (Math.abs(c * 16 * 16 - Math.round(c * 16 * 16)) < 1e-4) gridHits.p1++;
 }
-console.log(`  координат на сетке 1px  : ${((gridHits.p16 / gridHits.total) * 100).toFixed(1)}%`);
-console.log(`  координат на сетке 1/16px: ${((gridHits.p1 / gridHits.total) * 100).toFixed(1)}%`);
+console.log(`  coordinates on the 1px grid   : ${((gridHits.p16 / gridHits.total) * 100).toFixed(1)}%`);
+console.log(`  coordinates on the 1/16px grid: ${((gridHits.p1 / gridHits.total) * 100).toFixed(1)}%`);
 
-// размеры кубов в пикселях
+// cube sizes in pixels
 const sizesPx = new Set();
 for (const r of boxes) sizesPx.add(r.size.map(s => (s * 16).toFixed(3)).sort().join('x'));
-console.log(`\n  уникальных размеров кубов: ${sizesPx.size}`);
-console.log(`  примеры (px):`, [...sizesPx].slice(0, 8).join('  '));
+console.log(`\n  unique cube sizes: ${sizesPx.size}`);
+console.log(`  examples (px):`, [...sizesPx].slice(0, 8).join('  '));
 console.log('');

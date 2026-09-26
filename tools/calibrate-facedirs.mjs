@@ -1,25 +1,25 @@
 /**
- * Калибровка FACE_DIRS перебором.
+ * Brute-force calibration of FACE_DIRS.
  *
- * Берём только кубы с околонулевым поворотом — у них базис однозначен
- * (единичный), а значит грани независимы друг от друга и каждую можно
- * калибровать отдельно.
+ * Only cubes with a near-zero rotation are taken — their basis is unambiguous
+ * (the identity), so the faces are independent of each other and each one can
+ * be calibrated on its own.
  *
- * Для каждой грани перебираем все 8 допустимых пар (u, v) и выбираем ту,
- * где по всей модели нет ни нарушений (текстурная u непостоянна вдоль оси v),
- * ни отражений (перевёрнутый прямоугольник).
+ * For every face all 8 admissible (u, v) pairs are tried, and the one is chosen
+ * that across the whole model gives neither violations (texture u not constant
+ * along the v axis) nor mirrors (a reversed rectangle).
  *
- * Запуск: node tools/calibrate-facedirs.mjs model/model.obj
+ * Run: node tools/calibrate-facedirs.mjs model/model.obj
  */
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const { detectBox, orientations } = require('../plugin/geckolib_model_importer.js');
+const { detectBox, orientations } = require('../plugin/gltf_to_minecraft.js');
 
 const file = process.argv[2] ?? 'model/model.obj';
 const TEX = 128;
-const MAX_ANGLE = 10;   // градусов — выше базис становится неоднозначным
+const MAX_ANGLE = 10;   // degrees — above this the basis becomes ambiguous
 
 const positions = [], uvs = [], objects = [];
 let cur = null;
@@ -52,7 +52,7 @@ const NORMALS = {
 	up: [0, 1, 0], down: [0, -1, 0],
 };
 
-/** Все 8 допустимых пар (u,v) для грани: u вдоль одной оси плоскости, v вдоль другой. */
+/** All 8 admissible (u,v) pairs for a face: u along one axis of the plane, v along the other. */
 function candidates(normal) {
 	const inPlane = Object.values(AXES).filter(a => Math.abs(dot(a, normal)) < 0.5);
 	const out = [];
@@ -65,7 +65,7 @@ function candidates(normal) {
 	return out;
 }
 
-// --- собираем образцы граней у слабо повёрнутых кубов ---
+// --- collect face samples from barely rotated cubes ---
 
 const perFace = {};
 for (const name in NORMALS) perFace[name] = [];
@@ -77,7 +77,7 @@ for (const obj of objects) {
 	const box = detectBox([...uniq.values()]);
 	if (!box) continue;
 
-	// базис, ближайший к единичному — для слабо повёрнутых кубов он и есть верный
+	// the basis closest to the identity — for barely rotated cubes it is the right one
 	const o = orientations(box.axes, box.size)[0];
 	const angle = Math.acos(Math.min(1, Math.max(-1, (o.trace - 1) / 2))) * 180 / Math.PI;
 	if (angle > MAX_ANGLE) continue;
@@ -101,9 +101,9 @@ for (const obj of objects) {
 	}
 }
 
-console.log(`\nКубов в калибровке: ${used} (поворот < ${MAX_ANGLE}°)\n`);
+console.log(`\nCubes in the calibration: ${used} (rotation < ${MAX_ANGLE}°)\n`);
 
-// --- перебор ---
+// --- brute force ---
 
 function score(groups, u, v) {
 	let violations = 0, flips = 0;
@@ -130,7 +130,7 @@ function score(groups, u, v) {
 	return { violations, flips };
 }
 
-console.log('грань   лучший вариант      нарушений  отражений   (все варианты)');
+console.log('face    best variant        violations mirrors     (all variants)');
 const result = {};
 for (const name in NORMALS) {
 	const groups = perFace[name];
@@ -139,11 +139,11 @@ for (const name in NORMALS) {
 		.sort((a, b) => (a.violations - b.violations) || (a.flips - b.flips));
 	const best = scored[0];
 	result[name] = best;
-	const alt = scored.slice(1, 4).map(s => `${label(s.u)}/${label(s.v)}:${s.violations}в${s.flips}о`).join(' ');
+	const alt = scored.slice(1, 4).map(s => `${label(s.u)}/${label(s.v)}:${s.violations}v${s.flips}m`).join(' ');
 	console.log(`${name.padEnd(7)} u=${label(best.u)} v=${label(best.v)}   ${String(best.violations).padStart(6)}  ${String(best.flips).padStart(9)}   ${alt}`);
 }
 
-console.log(`\nГотовая таблица для FACE_DIRS:\n`);
+console.log(`\nReady table for FACE_DIRS:\n`);
 for (const name in result) {
 	const r = result[name];
 	console.log(`\t${(name + ':').padEnd(7)}{ normal: [${NORMALS[name]}], u: [${r.u}], v: [${r.v}] },`);

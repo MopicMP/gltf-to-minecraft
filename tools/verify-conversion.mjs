@@ -1,19 +1,19 @@
 /**
- * Прогоняет ядро плагина (solveBox) по настоящему OBJ, без запуска Blockbench.
- * Импортирует функцию из plugin/geckolib_model_importer.js — не копию.
+ * Runs the plugin core (solveBox) over a real OBJ, without starting Blockbench.
+ * Imports the function from plugin/gltf_to_minecraft.js — not a copy.
  *
- * Запуск: node tools/verify-conversion.mjs model/model.obj
+ * Run: node tools/verify-conversion.mjs model/model.obj
  */
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const { solveBox } = require('../plugin/geckolib_model_importer.js');
+const { solveBox } = require('../plugin/gltf_to_minecraft.js');
 
 const file = process.argv[2] ?? 'model/model.obj';
-const TEX = 128;   // размер текстуры проекта
+const TEX = 128;   // project texture size
 
-// ------------------------------------------------------------- парсинг OBJ
+// ------------------------------------------------------------- OBJ parsing
 
 const positions = [], uvs = [], objects = [];
 let current = null;
@@ -32,13 +32,13 @@ for (const raw of fs.readFileSync(file, 'utf8').split('\n')) {
 		});
 		current.faces.push({
 			positions: corners.map(c => positions[c.v]),
-			// в Blockbench UV в пикселях текстуры и ось V смотрит вниз, в OBJ — наоборот
+			// in Blockbench UV are in texture pixels and the V axis points down, in OBJ — the other way
 			uvs: corners.map(c => c.t < 0 ? null : [uvs[c.t][0] * TEX, (1 - uvs[c.t][1]) * TEX]),
 		});
 	}
 }
 
-// -------------------------------------------------------------- проверки
+// -------------------------------------------------------------- checks
 
 const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
 const add = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
@@ -53,9 +53,9 @@ for (const obj of objects) {
 	if (sol.error) { problems.push(`${obj.name}: ${sol.error}`); continue; }
 	okSolve++;
 
-	// --- форма восстанавливается точно? ---
-	// куб задаётся как center ± size/2 с поворотом вокруг center.
-	// Разворачиваем обратно в 8 углов и сравниваем с исходными вершинами.
+	// --- is the shape restored exactly? ---
+	// a cube is given as center ± size/2 with a rotation about center.
+	// It is unfolded back into 8 corners and compared with the source vertices.
 	const half = mul(sol.size, 0.5);
 	const corners = [];
 	for (const sx of [-1, 1]) for (const sy of [-1, 1]) for (const sz of [-1, 1]) {
@@ -72,20 +72,20 @@ for (const obj of objects) {
 	const span = Math.max(...sol.size) || 1;
 	worstShape.push(worst / span);
 	if (worst <= span * 1e-5) okShape++;
-	else problems.push(`${obj.name}: форма расходится на ${worst.toExponential(2)}`);
+	else problems.push(`${obj.name}: shape differs by ${worst.toExponential(2)}`);
 
 	totalViolations += sol.violations;
-	if (sol.violations) problems.push(`${obj.name}: ${sol.violations} несостыковок UV`);
+	if (sol.violations) problems.push(`${obj.name}: ${sol.violations} UV mismatches`);
 	emptyFaces += sol.emptyFaces.length;
 	uvFaces += Object.keys(sol.faceUV).length;
 
-	// Косвенная проверка ЗНАКОВ в FACE_DIRS.
-	// Перевёрнутый прямоугольник (x1>x2) Blockbench читает как отражение. Изредка
-	// это законно, но если у какого-то направления перевёрнуты почти все грани —
-	// значит знак в FACE_DIRS для него выбран неверно.
-	// Считаем только по слабо повёрнутым кубам: у сильно повёрнутых выбор одного
-	// из 24 базисов неоднозначен (несколько дают ноль нарушений), и отражение
-	// там — следствие выбора базиса, а не ошибки в FACE_DIRS.
+	// An indirect check of the SIGNS in FACE_DIRS.
+	// Blockbench reads a reversed rectangle (x1>x2) as a mirror. Occasionally
+	// that is legitimate, but if almost all faces of some direction are reversed —
+	// the sign in FACE_DIRS for it was chosen wrong.
+	// Only barely rotated cubes are counted: for strongly rotated ones the choice of one
+	// of the 24 bases is ambiguous (several give zero violations), and a mirror
+	// there follows from the choice of basis, not from a mistake in FACE_DIRS.
 	const trace = sol.vx[0] + sol.vy[1] + sol.vz[2];
 	const angle = Math.acos(Math.min(1, Math.max(-1, (trace - 1) / 2))) * 180 / Math.PI;
 	if (angle > 10) continue;
@@ -98,34 +98,34 @@ for (const obj of objects) {
 	}
 }
 
-// --------------------------------------------------------------- отчёт
+// --------------------------------------------------------------- report
 
 const n = objects.length;
-console.log(`\n=== ПРОВЕРКА ЯДРА КОНВЕРТЕРА (${n} объектов) ===\n`);
-console.log(`Распознано как ящик   : ${okSolve}/${n}`);
-console.log(`Форма восстановлена   : ${okShape}/${n} точно`);
-console.log(`Граней с UV           : ${uvFaces}`);
-console.log(`Граней без исходника  : ${emptyFaces} (будут скрыты)`);
-console.log(`UV требуют поворота   : ${totalViolations}`);
+console.log(`\n=== CHECK OF THE CONVERTER CORE (${n} objects) ===\n`);
+console.log(`Recognised as a box  : ${okSolve}/${n}`);
+console.log(`Shape restored       : ${okShape}/${n} exactly`);
+console.log(`Faces with UV        : ${uvFaces}`);
+console.log(`Faces without source : ${emptyFaces} (will be hidden)`);
+console.log(`UV needing rotation  : ${totalViolations}`);
 
 if (worstShape.length) {
 	worstShape.sort((a, b) => a - b);
-	console.log(`\nХудшее относительное отклонение формы: ${worstShape[worstShape.length - 1].toExponential(2)}`);
+	console.log(`\nWorst relative shape deviation: ${worstShape[worstShape.length - 1].toExponential(2)}`);
 }
 
-console.log(`\nОтражённые UV по граням (высокий % = неверный знак в FACE_DIRS):`);
+console.log(`\nMirrored UV per face (a high % = a wrong sign in FACE_DIRS):`);
 for (const [name, f] of Object.entries(flips)) {
 	const pu = ((f.u / f.total) * 100).toFixed(0), pv = ((f.v / f.total) * 100).toFixed(0);
-	const flag = (f.u / f.total > 0.9 || f.v / f.total > 0.9) ? '  ← подозрительно' : '';
-	console.log(`  ${name.padEnd(6)} u:${pu.padStart(3)}%  v:${pv.padStart(3)}%  из ${f.total}${flag}`);
+	const flag = (f.u / f.total > 0.9 || f.v / f.total > 0.9) ? '  ← suspicious' : '';
+	console.log(`  ${name.padEnd(6)} u:${pu.padStart(3)}%  v:${pv.padStart(3)}%  of ${f.total}${flag}`);
 }
 
 if (problems.length) {
-	console.log(`\nПроблемы (${problems.length}):`);
+	console.log(`\nProblems (${problems.length}):`);
 	for (const p of problems.slice(0, 15)) console.log('  ' + p);
-	if (problems.length > 15) console.log(`  …и ещё ${problems.length - 15}`);
+	if (problems.length > 15) console.log(`  …and ${problems.length - 15} more`);
 }
 
 const pass = okSolve === n && okShape === n && totalViolations === 0;
-console.log(`\n${pass ? '✅ ВСЁ ЧИСТО — конвертация без потерь' : '❌ ЕСТЬ ПРОБЛЕМЫ, см. выше'}\n`);
+console.log(`\n${pass ? '✅ ALL CLEAN — lossless conversion' : '❌ THERE ARE PROBLEMS, see above'}\n`);
 process.exit(pass ? 0 : 1);

@@ -1,11 +1,11 @@
 /**
- * Собирает из model/model.obj три варианта glTF, чтобы было на чём проверять
- * парсер: внешний .bin, base64 внутри и бинарный .glb.
+ * Builds three glTF variants from model/model.obj, so the parser has something
+ * to be checked on: an external .bin, base64 inside, and a binary .glb.
  *
- * Специально раскладывает объекты по узлам с ненулевыми трансформациями —
- * иначе иерархия и матрицы узлов остались бы непроверенными.
+ * Objects are deliberately put under nodes with non-zero transforms —
+ * otherwise the hierarchy and node matrices would go unchecked.
  *
- * Запуск: node tools/make-gltf-fixtures.mjs model/model.obj
+ * Run: node tools/make-gltf-fixtures.mjs model/model.obj
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -14,7 +14,7 @@ const src = process.argv[2] ?? 'model/model.obj';
 const outDir = 'test-fixtures';
 fs.mkdirSync(outDir, { recursive: true });
 
-// ---------------------------------------------------------------- парсинг OBJ
+// ---------------------------------------------------------------- OBJ parsing
 
 const positions = [], uvs = [], objects = [];
 let cur = null;
@@ -31,10 +31,10 @@ for (const raw of fs.readFileSync(src, 'utf8').split('\n')) {
 	}
 }
 
-// -------------------------------------------------- сборка буферов на объект
+// -------------------------------------------------- per-object buffer assembly
 
-// Узлам даём сдвиг, а вершины на него компенсируем — геометрия в мире
-// не меняется, но матрицы узлов перестают быть единичными и тоже проверяются.
+// Nodes get an offset and the vertices are compensated for it — the geometry in
+// the world does not change, but node matrices stop being identity and get checked too.
 const nodeOffset = i => [((i % 5) - 2) * 0.25, ((i % 3) - 1) * 0.5, ((i % 7) - 3) * 0.125];
 
 const chunks = [];
@@ -53,7 +53,7 @@ function pushView(buf, target) {
 }
 
 objects.forEach((obj, oi) => {
-	// уникальные вершины внутри объекта
+	// unique vertices within the object
 	const map = new Map();
 	const vp = [], vt = [], idx = [];
 	const off = nodeOffset(oi);
@@ -64,7 +64,7 @@ objects.forEach((obj, oi) => {
 				map.set(key, vp.length);
 				const p = positions[c.v];
 				vp.push([p[0] - off[0], p[1] - off[1], p[2] - off[2]]);
-				// в OBJ ось V идёт вверх, в glTF — вниз
+				// in OBJ the V axis points up, in glTF — down
 				vt.push(c.t < 0 ? [0, 0] : [uvs[c.t][0], 1 - uvs[c.t][1]]);
 			}
 			idx.push(map.get(key));
@@ -112,7 +112,7 @@ const baseGLTF = {
 	buffers: [{ byteLength: binary.length }],
 };
 
-// ------------------------------------------------------- вариант 1: внешний .bin
+// ------------------------------------------------------- variant 1: external .bin
 
 const ext = structuredClone(baseGLTF);
 ext.buffers[0].uri = 'model.bin';
@@ -120,14 +120,14 @@ fs.mkdirSync(path.join(outDir, 'external'), { recursive: true });
 fs.writeFileSync(path.join(outDir, 'external', 'model.gltf'), JSON.stringify(ext));
 fs.writeFileSync(path.join(outDir, 'external', 'model.bin'), binary);
 
-// ------------------------------------------------------- вариант 2: base64
+// ------------------------------------------------------- variant 2: base64
 
 const emb = structuredClone(baseGLTF);
 emb.buffers[0].uri = 'data:application/octet-stream;base64,' + binary.toString('base64');
 fs.mkdirSync(path.join(outDir, 'embedded'), { recursive: true });
 fs.writeFileSync(path.join(outDir, 'embedded', 'model.gltf'), JSON.stringify(emb));
 
-// ------------------------------------------------------- вариант 3: .glb
+// ------------------------------------------------------- variant 3: .glb
 
 const glbJSON = structuredClone(baseGLTF);
 const jsonBuf = Buffer.from(JSON.stringify(glbJSON));
@@ -143,7 +143,7 @@ glb.writeUInt32LE(total, p); p += 4;
 glb.writeUInt32LE(jsonBuf.length + jsonPad, p); p += 4;
 glb.writeUInt32LE(0x4E4F534A, p); p += 4;
 jsonBuf.copy(glb, p); p += jsonBuf.length;
-for (let i = 0; i < jsonPad; i++) glb.writeUInt8(0x20, p++);   // JSON добивается пробелами
+for (let i = 0; i < jsonPad; i++) glb.writeUInt8(0x20, p++);   // JSON is padded with spaces
 glb.writeUInt32LE(binary.length + binPad, p); p += 4;
 glb.writeUInt32LE(0x004E4942, p); p += 4;
 binary.copy(glb, p); p += binary.length;
@@ -151,7 +151,7 @@ binary.copy(glb, p); p += binary.length;
 fs.mkdirSync(path.join(outDir, 'glb'), { recursive: true });
 fs.writeFileSync(path.join(outDir, 'glb', 'model.glb'), glb);
 
-console.log(`Собрано ${objects.length} объектов, буфер ${binary.length} байт`);
+console.log(`Built ${objects.length} objects, buffer ${binary.length} bytes`);
 console.log(`  ${outDir}/external/model.gltf + model.bin`);
 console.log(`  ${outDir}/embedded/model.gltf  (base64)`);
-console.log(`  ${outDir}/glb/model.glb        (${glb.length} байт)`);
+console.log(`  ${outDir}/glb/model.glb        (${glb.length} bytes)`);

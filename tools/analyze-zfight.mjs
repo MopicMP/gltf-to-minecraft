@@ -1,21 +1,21 @@
 /**
- * Совпадающие грани (z-fighting): где кубы лежат в одной плоскости.
+ * Coinciding faces (z-fighting): where cubes lie in one plane.
  *
- * Видеокарта не может решить, какая из двух совпадающих граней ближе, и на
- * модели идёт рябь. Инструмент считает, сколько таких мест и какого они рода —
- * от этого зависит, чем лечить.
+ * The GPU cannot decide which of two coinciding faces is closer, and the model
+ * shimmers. The tool counts how many such places there are and of what kind —
+ * the cure depends on it.
  *
- * Запуск: node tools/analyze-zfight.mjs <папка с распакованными моделями>
+ * Run: node tools/analyze-zfight.mjs <folder with unpacked models>
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const { parseGLTFFiles, solveBox, splitComponents, snapVec } = require('../plugin/geckolib_model_importer.js');
+const { parseGLTFFiles, solveBox, splitComponents, snapVec } = require('../plugin/gltf_to_minecraft.js');
 
 const root = process.argv[2];
-if (!root) { console.log('Укажите папку с распакованными моделями'); process.exit(1); }
+if (!root) { console.log('Specify a folder with unpacked models'); process.exit(1); }
 
 const readDir = dir => {
 	const files = {};
@@ -46,8 +46,8 @@ for (const dir of dirs) {
 	let parsed;
 	try { parsed = parseGLTFFiles(readDir(dir), { scale: 16, uvWidth: 1, uvHeight: 1 }); } catch { continue; }
 
-	// Берём только осевые кубы: у повёрнутых плоскости совпадают редко,
-	// а сравнивать их пришлось бы совсем иначе.
+	// Only axis-aligned cubes are taken: rotated ones rarely share a plane,
+	// and comparing them would take a completely different approach.
 	const boxes = [];
 	for (const obj of parsed.objects) {
 		for (const faces of splitComponents(obj.faces)) {
@@ -67,8 +67,8 @@ for (const dir of dirs) {
 		}
 	}
 
-	// Пара граней конфликтует, если лежит в одной плоскости и проекции
-	// перекрываются по площади (касание ребром безобидно).
+	// A pair of faces conflicts if they lie in one plane and their projections
+	// overlap by area (touching along an edge is harmless).
 	let sameSide = 0, backToBack = 0, covered = 0, partial = 0;
 	const examples = [];
 	const overlap = (a, b, skip) => {
@@ -92,17 +92,17 @@ for (const dir of dirs) {
 			for (let ax = 0; ax < 3; ax++) {
 				const area = overlap(a, b, ax);
 				if (!area) continue;
-				// одна сторона: обе грани смотрят наружу в одну сторону — рябь видна
+				// same side: both faces look outward in the same direction — the shimmer is visible
 				const sameLo = Math.abs(a.lo[ax] - b.lo[ax]) < EPS;
 				const sameHi = Math.abs(a.hi[ax] - b.hi[ax]) < EPS;
-				// спина к спине: конец одного совпал с началом другого
+				// back to back: the end of one coincides with the start of the other
 				const touch = Math.abs(a.hi[ax] - b.lo[ax]) < EPS || Math.abs(b.hi[ax] - a.lo[ax]) < EPS;
 				if (sameLo || sameHi) {
 					sameSide++;
-					// Вложен ли один куб в другой ЦЕЛИКОМ, по всем трём осям.
-					// Только тогда его грани действительно не видны и их можно
-					// не рисовать. У просто копланарных граней ни одна другую
-					// не закрывает — они на одной глубине, потому и рябь.
+					// Whether one cube is nested inside another ENTIRELY, along all three axes.
+					// Only then are its faces really invisible and can
+					// be left undrawn. With merely coplanar faces neither one
+					// covers the other — they are at the same depth, hence the shimmer.
 					const within = (x, y) => {
 						for (let i = 0; i < 3; i++) {
 							if (x.lo[i] < y.lo[i] - EPS || x.hi[i] > y.hi[i] + EPS) return false;
@@ -113,9 +113,9 @@ for (const dir of dirs) {
 					if (nested) covered++;
 					else partial++;
 					if (examples.length < 3) {
-						examples.push(`${a.name} / ${b.name} — общая плоскость по ${AXES[ax]}`
-							+ `, площадь ${area.toFixed(2)} px²`
-							+ (nested ? ' — один куб вложен в другой целиком' : ' — кубы просто копланарны'));
+						examples.push(`${a.name} / ${b.name} — shared plane along ${AXES[ax]}`
+							+ `, area ${area.toFixed(2)} px²`
+							+ (nested ? ' — one cube nested entirely inside the other' : ' — the cubes are merely coplanar'));
 					}
 				} else if (touch) {
 					backToBack++;
@@ -127,9 +127,9 @@ for (const dir of dirs) {
 	if (!boxes.length) continue;
 	const label = path.relative(root, dir).replace(/[/\\]source$/, '');
 	console.log(`### ${label}`);
-	console.log(`    осевых кубов ${boxes.length} · совпадающих граней «в одну сторону» ${sameSide}`
-		+ ` · стыков «спина к спине» ${backToBack}`);
-	if (sameSide) console.log(`      из совпадающих: один куб вложен в другой ${covered}, просто копланарны ${partial}`);
+	console.log(`    axis-aligned cubes ${boxes.length} · coinciding faces "same side" ${sameSide}`
+		+ ` · "back to back" joints ${backToBack}`);
+	if (sameSide) console.log(`      of the coinciding: one cube nested in another ${covered}, merely coplanar ${partial}`);
 	for (const e of examples) console.log(`      ${e}`);
 }
 console.log('');

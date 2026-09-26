@@ -1,14 +1,14 @@
 /**
- * Развод совпадающих граней через inflate.
+ * Separating coinciding faces through inflate.
  *
- * Два куба в одной плоскости дают рябь: видеокарта не может решить, какая
- * грань ближе. Сдвигать координаты нельзя — вместо ровного 5 в панели появится
- * 4.99432. Вместо этого меньший куб пары чуть раздувается полем inflate.
+ * Two cubes in one plane shimmer: the GPU cannot decide which face is
+ * closer. Coordinates must not be shifted — a clean 5 in the panel would turn into
+ * 4.99432. Instead, the smaller cube of the pair is slightly inflated through the inflate field.
  *
- * Проверяются и повёрнутые кубы: у них from/to локальные, и габаритный ящик
- * из center ± size/2 не совпадает с настоящим положением.
+ * Rotated cubes are checked too: their from/to are local, and a bounding box
+ * built from center ± size/2 does not match their real position.
  *
- * Запуск: node tools/verify-coplanar.mjs [папка с распакованными моделями]
+ * Run: node tools/verify-coplanar.mjs [folder with unpacked models]
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -16,37 +16,37 @@ import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
 const { resolveCoplanar, cubeFaces, solveBox, splitComponents, parseGLTFFiles } =
-	require('../plugin/geckolib_model_importer.js');
+	require('../plugin/gltf_to_minecraft.js');
 
 let bad = 0;
 const ok = (cond, msg) => { if (!cond) bad++; console.log(`  ${cond ? '✅' : '❌'} ${msg}`); };
 
-/** Неповёрнутый куб по габаритам. */
+/** An unrotated cube by its bounds. */
 const box = (lo, hi) => ({
 	center: [0, 1, 2].map(i => (lo[i] + hi[i]) / 2),
 	size: [0, 1, 2].map(i => hi[i] - lo[i]),
 	vx: [1, 0, 0], vy: [0, 1, 0], vz: [0, 0, 1],
 });
 
-/** Куб, повёрнутый вокруг Y на угол deg. */
+/** A cube rotated about Y by deg. */
 const turned = (lo, hi, deg) => {
 	const r = deg * Math.PI / 180, c = Math.cos(r), s = Math.sin(r);
 	return Object.assign(box(lo, hi), { vx: [c, 0, -s], vy: [0, 1, 0], vz: [s, 0, c] });
 };
 
-/** Куб по центру и размеру, повёрнутый вокруг Y. */
+/** A cube by centre and size, rotated about Y. */
 const turnedAt = (center, size, deg) => {
 	const r = deg * Math.PI / 180, c = Math.cos(r), s = Math.sin(r);
 	return { center, size, vx: [c, 0, -s], vy: [0, 1, 0], vz: [s, 0, c] };
 };
 
 /**
- * Накладка на переднюю грань повёрнутого куба.
+ * An overlay on the front face of a rotated cube.
  *
- * Каждый куб вращается вокруг СВОЕГО origin, поэтому одинаковый угол ещё не
- * означает общей плоскости: у кубов с разными центрами передние грани
- * расходятся. Чтобы грани совпали, центр накладки надо сместить вдоль
- * локальной оси на разницу полуразмеров.
+ * Every cube rotates about ITS OWN origin, so the same angle does not yet
+ * mean a shared plane: for cubes with different centres the front faces
+ * drift apart. For the faces to coincide, the overlay's centre has to be shifted
+ * along the local axis by the difference of the half-sizes.
  */
 const facingOverlay = (base, size, deg) => {
 	const r = deg * Math.PI / 180, s = Math.sin(r), c = Math.cos(r);
@@ -56,68 +56,68 @@ const facingOverlay = (base, size, deg) => {
 		size, deg);
 };
 
-console.log('\n=== Осевые кубы ===');
+console.log('\n=== Axis-aligned cubes ===');
 
 let r = resolveCoplanar([box([0, 0, 0], [16, 16, 16]), box([2, 2, 2], [14, 14, 16])]);
-ok(r.pairs === 1, `совпадающие передние грани — конфликт (пар: ${r.pairs})`);
+ok(r.pairs === 1, `coinciding front faces — a conflict (pairs: ${r.pairs})`);
 ok(r.inflate[0] === 0 && r.inflate[1] > 0,
-	`раздут меньший куб, большой не тронут (${r.inflate[0]}, ${r.inflate[1]})`);
+	`the smaller cube is inflated, the big one is untouched (${r.inflate[0]}, ${r.inflate[1]})`);
 
 r = resolveCoplanar([box([0, 0, 0], [16, 16, 16]), box([0, 16, 0], [16, 24, 16])]);
-ok(r.pairs === 0, `стык кубов друг на друге — не конфликт (пар: ${r.pairs})`);
+ok(r.pairs === 0, `cubes stacked on each other — no conflict (pairs: ${r.pairs})`);
 
 r = resolveCoplanar([box([0, 0, 0], [8, 8, 8]), box([8, 0, 8], [16, 8, 16])]);
-ok(r.pairs === 0, `касание ребром — не конфликт (пар: ${r.pairs})`);
+ok(r.pairs === 0, `touching along an edge — no conflict (pairs: ${r.pairs})`);
 
 r = resolveCoplanar([box([0, 0, 0], [8, 8, 8]), box([40, 40, 40], [48, 48, 48])]);
-ok(r.pairs === 0, 'разнесённые кубы — не конфликт');
+ok(r.pairs === 0, 'cubes apart — no conflict');
 
-console.log('\n=== Слои расходятся на разную глубину ===');
+console.log('\n=== Layers go to different depths ===');
 r = resolveCoplanar([
 	box([0, 0, 0], [16, 16, 16]),
 	box([1, 1, 1], [15, 15, 16]),
 	box([2, 2, 2], [14, 14, 16]),
 ]);
-ok(r.inflate[0] === 0, `основа не раздута (${r.inflate[0]})`);
+ok(r.inflate[0] === 0, `the base is not inflated (${r.inflate[0]})`);
 ok(r.inflate[1] > r.inflate[0] && r.inflate[2] > r.inflate[1],
-	`каждый слой глубже: ${r.inflate[0]} < ${r.inflate[1].toFixed(3)} < ${r.inflate[2].toFixed(3)}`);
+	`every layer deeper: ${r.inflate[0]} < ${r.inflate[1].toFixed(3)} < ${r.inflate[2].toFixed(3)}`);
 
-console.log('\n=== Повёрнутые кубы ===');
+console.log('\n=== Rotated cubes ===');
 
-// Оба повёрнуты одинаково и лежат в одной плоскости — рябь будет.
+// Both rotated the same way and lying in one plane — there will be a shimmer.
 const base30 = turnedAt([8, 8, 8], [16, 16, 16], 30);
 r = resolveCoplanar([base30, facingOverlay(base30, [12, 12, 12], 30)]);
-ok(r.pairs === 1, `накладка на повёрнутом кубе — конфликт (пар: ${r.pairs})`);
-ok(r.inflate[0] === 0 && r.inflate[1] > 0, 'раздута накладка, основа не тронута');
+ok(r.pairs === 1, `an overlay on a rotated cube — a conflict (pairs: ${r.pairs})`);
+ok(r.inflate[0] === 0 && r.inflate[1] > 0, 'the overlay is inflated, the base is untouched');
 
-// Одинаковый угол, но разные центры: каждый куб вращается вокруг своего
-// origin, поэтому передние грани расходятся и общей плоскости нет.
+// Same angle, different centres: every cube rotates about its own
+// origin, so the front faces drift apart and there is no shared plane.
 r = resolveCoplanar([turned([0, 0, 0], [16, 16, 16], 30), turned([2, 2, 2], [14, 14, 16], 30)]);
-ok(r.pairs === 0, `смещённый куб под тем же углом — плоскости разные (пар: ${r.pairs})`);
+ok(r.pairs === 0, `an offset cube at the same angle — different planes (pairs: ${r.pairs})`);
 
-// Повёрнуты по-разному: плоскости граней не совпадают тем более.
+// Rotated differently: the face planes coincide even less.
 r = resolveCoplanar([base30, facingOverlay(base30, [12, 12, 12], 31)]);
-ok(r.pairs === 0, `разный угол — конфликта нет (пар: ${r.pairs})`);
+ok(r.pairs === 0, `a different angle — no conflict (pairs: ${r.pairs})`);
 
-// Поворот на 90°: базис становится перестановкой осей. Раньше габаритный ящик
-// считался покомпонентно и врал именно здесь.
+// A 90° rotation: the basis becomes a permutation of the axes. The bounding box used to be
+// computed per component and was wrong exactly here.
 const a90 = turned([0, 0, 0], [4, 16, 16], 90);
 const b90 = turned([0, 0, 0], [4, 12, 12], 90);
 r = resolveCoplanar([a90, b90]);
-ok(r.pairs >= 1, `поворот на 90° — совпадение найдено (пар: ${r.pairs})`);
+ok(r.pairs >= 1, `a 90° rotation — the match is found (pairs: ${r.pairs})`);
 
-console.log('\n=== Грани строятся в мировых координатах ===');
+console.log('\n=== Faces are built in world coordinates ===');
 const f = cubeFaces(turned([0, 0, 0], [16, 16, 16], 90));
 const normals = f.map(x => x.n.map(v => Math.round(v)).join(','));
-ok(normals.includes('1,0,0') || normals.includes('-1,0,0'), 'есть грань вдоль мирового X');
-ok(f.every(x => Math.abs(Math.hypot(...x.n) - 1) < 1e-9), 'все нормали единичные');
-ok(f.length === 6, `граней ровно шесть (${f.length})`);
+ok(normals.includes('1,0,0') || normals.includes('-1,0,0'), 'there is a face along world X');
+ok(f.every(x => Math.abs(Math.hypot(...x.n) - 1) < 1e-9), 'all normals are unit length');
+ok(f.length === 6, `exactly six faces (${f.length})`);
 
-console.log('\n=== Предохранитель на огромных моделях ===');
+console.log('\n=== The safety valve on huge models ===');
 const many = [];
 for (let i = 0; i < 30; i++) many.push(box([0, 0, 0], [1, 1, 1]));
 r = resolveCoplanar(many, 0.02, 10);
-ok(r.skipped === 30 && r.pairs === 0, `при превышении предела развод пропускается (skipped ${r.skipped})`);
+ok(r.skipped === 30 && r.pairs === 0, `over the limit, separation is skipped (skipped ${r.skipped})`);
 
 const root = process.argv[2];
 if (root && fs.existsSync(root)) {
@@ -141,8 +141,8 @@ if (root && fs.existsSync(root)) {
 	};
 	collect(root);
 
-	console.log('\n=== На настоящих моделях (масштаб ×16) ===');
-	console.log('  модель                                кубов  повёрнутых   пар  раздуто  макс.');
+	console.log('\n=== On real models (scale ×16) ===');
+	console.log('  model                                 cubes   rotated   pairs  inflated  max');
 	for (const dir of dirs) {
 		let parsed;
 		try { parsed = parseGLTFFiles(readDir(dir), { scale: 16, uvWidth: 1, uvHeight: 1 }); } catch { continue; }
@@ -163,9 +163,9 @@ if (root && fs.existsSync(root)) {
 		console.log(`  ${label.slice(0, 36).padEnd(38)} ${String(sols.length).padStart(5)} `
 			+ `${String(rotated).padStart(11)} ${String(res.pairs).padStart(5)} `
 			+ `${String(touched).padStart(8)} ${max.toFixed(3).padStart(6)}`);
-		if (max > 0.125) { bad++; console.log('    ❌ раздутие превысило половину шага сетки — станет заметно'); }
+		if (max > 0.125) { bad++; console.log('    ❌ inflation exceeded half a grid step — it will show'); }
 	}
 }
 
-console.log(bad ? `\n❌ ОШИБОК: ${bad}\n` : '\n✅ СОВПАДАЮЩИЕ ГРАНИ РАЗВОДЯТСЯ\n');
+console.log(bad ? `\n❌ ERRORS: ${bad}\n` : '\n✅ COINCIDING FACES ARE SEPARATED\n');
 process.exit(bad ? 1 : 0);

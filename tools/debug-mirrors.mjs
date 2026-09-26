@@ -1,12 +1,12 @@
 /**
- * Диагностика отражённых UV: где они и как распределены.
- * Запуск: node tools/debug-mirrors.mjs model/model.obj
+ * Diagnostics of mirrored UV: where they are and how they are distributed.
+ * Run: node tools/debug-mirrors.mjs model/model.obj
  */
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const { solveBox } = require('../plugin/geckolib_model_importer.js');
+const { solveBox } = require('../plugin/gltf_to_minecraft.js');
 
 const file = process.argv[2] ?? 'model/model.obj';
 const TEX = 128;
@@ -41,7 +41,7 @@ for (const obj of objects) {
 	const flippedV = entries.filter(([, uv]) => uv[1] > uv[3]).map(([n]) => n);
 	rows.push({
 		name: obj.name,
-		center: sol.center.map(v => +(v * 16).toFixed(2)),   // в пикселях
+		center: sol.center.map(v => +(v * 16).toFixed(2)),   // in pixels
 		faces: entries.length,
 		flippedU, flippedV,
 		uv: sol.faceUV,
@@ -49,57 +49,57 @@ for (const obj of objects) {
 	});
 }
 
-// --- распределение по числу отражённых граней на куб ---
-// ВАЖНО: считать И горизонталь, И вертикаль. Первая версия смотрела только на u
-// и из-за этого не показывала v-отражения (напр. у cube_107) — потерянное время.
+// --- distribution by the number of mirrored faces per cube ---
+// IMPORTANT: count BOTH horizontal AND vertical. The first version looked at u only
+// and so never showed v mirrors (e.g. on cube_107) — time lost.
 const flipCount = r => new Set([...r.flippedU, ...r.flippedV]).size;
 const hist = new Map();
 for (const r of rows) hist.set(flipCount(r), (hist.get(flipCount(r)) ?? 0) + 1);
-console.log(`\n=== Отражённых граней (u или v) на куб ===`);
+console.log(`\n=== Mirrored faces (u or v) per cube ===`);
 for (const [k, v] of [...hist.entries()].sort((a, b) => a[0] - b[0])) {
-	console.log(`  ${k} граней: ${v} кубов`);
+	console.log(`  ${k} faces: ${v} cubes`);
 }
-console.log(`\n  только по u: ${rows.reduce((s, r) => s + r.flippedU.length, 0)} граней`);
-console.log(`  только по v: ${rows.reduce((s, r) => s + r.flippedV.length, 0)} граней`);
+console.log(`\n  u only: ${rows.reduce((s, r) => s + r.flippedU.length, 0)} faces`);
+console.log(`  v only: ${rows.reduce((s, r) => s + r.flippedV.length, 0)} faces`);
 
 const dirty = rows.filter(r => flipCount(r));
-console.log(`\nВсего кубов с отражением: ${dirty.length} из ${rows.length}`);
+console.log(`\nCubes with a mirror in total: ${dirty.length} of ${rows.length}`);
 
-// --- целиком ли отражены кубы? ---
+// --- are the cubes mirrored as a whole? ---
 const whole = dirty.filter(r => r.flippedU.length === r.faces);
-console.log(`Отражены ЦЕЛИКОМ (все грани): ${whole.length}`);
-console.log(`Отражены ЧАСТИЧНО           : ${dirty.length - whole.length}`);
+console.log(`Mirrored ENTIRELY (all faces): ${whole.length}`);
+console.log(`Mirrored PARTLY              : ${dirty.length - whole.length}`);
 
-// --- где они находятся ---
+// --- where they are ---
 if (dirty.length) {
 	const ys = dirty.map(r => r.center[1]);
 	const xs = dirty.map(r => r.center[0]);
-	console.log(`\nПоложение отражённых кубов (пиксели):`);
-	console.log(`  Y (высота): ${Math.min(...ys).toFixed(1)} … ${Math.max(...ys).toFixed(1)}`);
-	console.log(`  X (лево/право): ${Math.min(...xs).toFixed(1)} … ${Math.max(...xs).toFixed(1)}`);
-	console.log(`  из них X<0: ${xs.filter(x => x < -0.01).length}, X>0: ${xs.filter(x => x > 0.01).length}, X≈0: ${xs.filter(x => Math.abs(x) <= 0.01).length}`);
+	console.log(`\nPosition of mirrored cubes (pixels):`);
+	console.log(`  Y (height): ${Math.min(...ys).toFixed(1)} … ${Math.max(...ys).toFixed(1)}`);
+	console.log(`  X (left/right): ${Math.min(...xs).toFixed(1)} … ${Math.max(...xs).toFixed(1)}`);
+	console.log(`  of them X<0: ${xs.filter(x => x < -0.01).length}, X>0: ${xs.filter(x => x > 0.01).length}, X≈0: ${xs.filter(x => Math.abs(x) <= 0.01).length}`);
 }
 
 const allY = rows.map(r => r.center[1]);
-console.log(`\nДля сравнения, вся модель по Y: ${Math.min(...allY).toFixed(1)} … ${Math.max(...allY).toFixed(1)}`);
+console.log(`\nFor comparison, the whole model along Y: ${Math.min(...allY).toFixed(1)} … ${Math.max(...allY).toFixed(1)}`);
 
-// --- есть ли у отражённого куба незеркальный двойник напротив по X? ---
-console.log(`\n=== Поиск зеркальных пар ===`);
+// --- does a mirrored cube have an unmirrored twin opposite along X? ---
+console.log(`\n=== Looking for mirror pairs ===`);
 let paired = 0;
 for (const r of dirty) {
 	const twin = rows.find(o => o !== r
 		&& Math.abs(o.center[0] + r.center[0]) < 0.05
 		&& Math.abs(o.center[1] - r.center[1]) < 0.05
 		&& Math.abs(o.center[2] - r.center[2]) < 0.05);
-	const mark = twin ? (twin.flippedU.length ? 'двойник ТОЖЕ отражён' : `двойник ${twin.name} чистый`) : 'двойника нет';
+	const mark = twin ? (twin.flippedU.length ? 'twin is mirrored TOO' : `twin ${twin.name} is clean`) : 'no twin';
 	if (twin && !twin.flippedU.length) paired++;
-	console.log(`  ${r.name.padEnd(10)} центр=[${r.center.join(', ')}] отражено:${r.flippedU.length}/6  → ${mark}`);
+	console.log(`  ${r.name.padEnd(10)} centre=[${r.center.join(', ')}] mirrored:${r.flippedU.length}/6  → ${mark}`);
 }
-console.log(`\nОтражённых кубов с чистым зеркальным двойником: ${paired} из ${dirty.length}`);
+console.log(`\nMirrored cubes with a clean mirror twin: ${paired} of ${dirty.length}`);
 
-// --- используют ли двойники одни и те же области текстуры? ---
-// Если да, различие между ними ровно одно — отражение, и наша запись верна.
-console.log(`\n=== Сверка текстурных областей у пар ===`);
+// --- do the twins use the same texture areas? ---
+// If so, the only difference between them is the mirror, and our record is right.
+console.log(`\n=== Comparing texture areas of the pairs ===`);
 const rectKey = uv => [Math.min(uv[0], uv[2]), Math.min(uv[1], uv[3]), Math.max(uv[0], uv[2]), Math.max(uv[1], uv[3])]
 	.map(v => v.toFixed(2)).join('/');
 
@@ -114,7 +114,7 @@ for (const r of dirty.filter(d => d.flippedU.length === 6)) {
 	const b = Object.values(twin.uv).map(rectKey).sort();
 	const same = a.length === b.length && a.every((v, i) => v === b[i]);
 	const sizeSame = r.size.join() === twin.size.join();
-	console.log(`  ${r.name.padEnd(10)} ↔ ${twin.name.padEnd(10)} области ${same ? 'СОВПАДАЮТ' : 'РАЗНЫЕ'}, размеры ${sizeSame ? 'совпадают' : 'разные'}`);
+	console.log(`  ${r.name.padEnd(10)} ↔ ${twin.name.padEnd(10)} areas ${same ? 'MATCH' : 'DIFFER'}, sizes ${sizeSame ? 'match' : 'differ'}`);
 	if (!same) {
 		console.log(`      ${r.name}: ${a.join('  ')}`);
 		console.log(`      ${twin.name}: ${b.join('  ')}`);

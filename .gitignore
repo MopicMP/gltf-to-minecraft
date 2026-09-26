@@ -3,3 +3,6 @@ test-fixtures/
 .env.*
 logs*.md
 models/
+test/
+model/
+model(gltf)/

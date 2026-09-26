@@ -1,14 +1,14 @@
 /**
- * Разбор конкретных кубов: углы Эйлера и раскладка UV по граням.
+ * Inspection of specific cubes: Euler angles and the UV layout per face.
  *
- * Запуск: node tools/debug-cubes.mjs model/model.obj 40,46,49 0,2,37
- *   первый список — «группа A», второй — «группа B» (можно опустить)
+ * Run: node tools/debug-cubes.mjs model/model.obj 40,46,49 0,2,37
+ *   the first list is "group A", the second is "group B" (may be omitted)
  */
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const { solveBox, FACE_NAMES } = require('../plugin/geckolib_model_importer.js');
+const { solveBox, FACE_NAMES } = require('../plugin/gltf_to_minecraft.js');
 
 const file = process.argv[2] ?? 'model/model.obj';
 const groupA = (process.argv[3] ?? '').split(',').filter(Boolean);
@@ -36,8 +36,8 @@ for (const raw of fs.readFileSync(file, 'utf8').split('\n')) {
 	}
 }
 
-// ------------------------------------------------- разложение углов Эйлера
-// Матрица: столбцы — базисные векторы. Формулы как в THREE.Euler.
+// ------------------------------------------------- Euler angle decomposition
+// Matrix: columns are the basis vectors. Formulas as in THREE.Euler.
 
 const clamp = v => Math.min(1, Math.max(-1, v));
 const deg = r => +(r * 180 / Math.PI).toFixed(2);
@@ -68,7 +68,7 @@ for (const o of objects) {
 	if (!s.error) solved.set(o.name, s);
 }
 
-// ------------------------------------- сколько осей задействовано в повороте
+// ------------------------------------- how many axes take part in the rotation
 
 let multi = 0, single = 0, zero = 0;
 const multiNames = [];
@@ -79,45 +79,45 @@ for (const [name, s] of solved) {
 	else if (n === 1) single++;
 	else { multi++; multiNames.push(name); }
 }
-console.log(`\n=== Сколько осей в повороте (XYZ) ===`);
-console.log(`  без поворота     : ${zero}`);
-console.log(`  одна ось         : ${single}`);
-console.log(`  две и более осей : ${multi}`);
-console.log(`\nКубы с поворотом по нескольким осям (${multi}):`);
+console.log(`\n=== Axes in the rotation (XYZ) ===`);
+console.log(`  no rotation      : ${zero}`);
+console.log(`  one axis         : ${single}`);
+console.log(`  two or more axes : ${multi}`);
+console.log(`\nCubes rotated about several axes (${multi}):`);
 console.log('  ' + multiNames.join(', '));
 
-// -------------------------------------------------------- разбор группы A
+// -------------------------------------------------------- group A
 
 if (groupA.length) {
 	const names = groupA.map(n => nameOf(+n));
-	console.log(`\n=== ГРУППА A — углы Эйлера ===`);
-	console.log(`(если порядок сборки в Blockbench другой, многоосевые собираются неверно)\n`);
+	console.log(`\n=== GROUP A — Euler angles ===`);
+	console.log(`(if Blockbench assembles in a different order, multi-axis cubes come out wrong)\n`);
 	let allMulti = true;
 	for (const name of names) {
 		const s = solved.get(name);
-		if (!s) { console.log(`  ${name}: не решён`); continue; }
+		if (!s) { console.log(`  ${name}: not solved`); continue; }
 		const a = eulerXYZ(s.vx, s.vy, s.vz);
 		const b = eulerZYX(s.vx, s.vy, s.vz);
 		const axes = a.filter(v => Math.abs(v) > 0.01).length;
 		if (axes < 2) allMulti = false;
-		console.log(`  ${name.padEnd(10)} осей:${axes}  XYZ=[${a.join(', ')}]  ZYX=[${b.join(', ')}]`);
+		console.log(`  ${name.padEnd(10)} axes:${axes}  XYZ=[${a.join(', ')}]  ZYX=[${b.join(', ')}]`);
 	}
-	console.log(`\n  Все ли многоосевые? ${allMulti ? 'ДА — гипотеза о порядке Эйлера подтверждается' : 'НЕТ — дело не только в Эйлере'}`);
+	console.log(`\n  All multi-axis? ${allMulti ? 'YES — the Euler order hypothesis holds' : 'NO — it is not only about Euler'}`);
 
 	const inA = new Set(names);
 	const extra = multiNames.filter(n => !inA.has(n));
-	console.log(`  Многоосевых вне группы A: ${extra.length}${extra.length ? ' → ' + extra.join(', ') : ''}`);
+	console.log(`  Multi-axis outside group A: ${extra.length}${extra.length ? ' → ' + extra.join(', ') : ''}`);
 }
 
-// -------------------------------------------------------- разбор группы B
+// -------------------------------------------------------- group B
 
 if (groupB.length) {
-	console.log(`\n=== ГРУППА B — раскладка UV по граням ===`);
-	console.log(`(m = отражено по обеим осям = поворот текстуры на 180°)\n`);
+	console.log(`\n=== GROUP B — UV layout per face ===`);
+	console.log(`(m = mirrored on both axes = texture rotated by 180°)\n`);
 	for (const n of groupB) {
 		const name = nameOf(+n);
 		const s = solved.get(name);
-		if (!s) { console.log(`  ${name}: не решён`); continue; }
+		if (!s) { console.log(`  ${name}: not solved`); continue; }
 		const parts = [];
 		for (const f of FACE_NAMES) {
 			const uv = s.faceUV[f];
@@ -126,7 +126,7 @@ if (groupB.length) {
 			parts.push(`${f}:${fu && fv ? '180°' : fu ? 'u' : fv ? 'v' : '.'}`);
 		}
 		const e = eulerXYZ(s.vx, s.vy, s.vz);
-		console.log(`  ${name.padEnd(10)} ${parts.join('  ')}   поворот=[${e.join(', ')}]`);
+		console.log(`  ${name.padEnd(10)} ${parts.join('  ')}   rotation=[${e.join(', ')}]`);
 	}
 }
 console.log('');

@@ -1,21 +1,21 @@
 /**
- * Проверяет математику анимаций БЕЗ Blockbench.
+ * Checks the animation maths WITHOUT Blockbench.
  *
- * Собирает позу так, как её соберёт Blockbench из наших кадров, и сравнивает
- * с истинной позой из glTF. Всё, что нужно, — чистая арифметика, поэтому
- * ошибку видно здесь, а не после очередного круга «импортируй и посмотри».
+ * Assembles the pose the way Blockbench will assemble it from our keyframes, and
+ * compares it with the true pose from glTF. All it takes is plain arithmetic, so
+ * a mistake shows up here rather than after yet another "import and look" round.
  *
- * Модель в Blockbench: кости стоят с нулевым поворотом, поза покоя запечена
- * в мировые координаты, а кадр задаёт смещение. Поворот кости применяется
- * ВОКРУГ ЕЁ ТОЧКИ ПРИВЯЗКИ, вложенные кости перемножаются.
+ * The model in Blockbench: bones sit with zero rotation, the rest pose is baked
+ * into world coordinates, and a keyframe sets an offset. A bone rotation is applied
+ * AROUND ITS PIVOT, and nested bones are multiplied together.
  *
- * Запуск: node tools/verify-animation.mjs [имя анимации] [время]
+ * Run: node tools/verify-animation.mjs [animation name] [time]
  */
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const M = require('../plugin/geckolib_model_importer.js');
+const M = require('../plugin/gltf_to_minecraft.js');
 const { matMul, matFromTRS, matApply, matIdentity, boneDeltaRotation, boneDeltaPosition } = M;
 
 const wantAnim = process.argv[2] || null;
@@ -28,7 +28,7 @@ const parsed = M.parseGLTFFiles(
 const byIdx = new Map(parsed.hierarchy.map(h => [h.index, h]));
 const chainOf = h => { const c = []; for (let n = h; n; n = n.parent >= 0 ? byIdx.get(n.parent) : null) c.unshift(n); return c; };
 
-/** Значение канала в момент t (линейная интерполяция, как в glTF). */
+/** Channel value at time t (linear interpolation, as in glTF). */
 function sample(ch, t) {
 	const { times, values } = ch;
 	if (t <= times[0]) return values[0];
@@ -38,29 +38,29 @@ function sample(ch, t) {
 	const k = (t - times[i]) / (times[i + 1] - times[i]);
 	const a = values[i], b = values[i + 1];
 	const out = a.map((v, j) => v + (b[j] - v) * k);
-	if (ch.path === 'rotation') {   // кватернионы нормируем
+	if (ch.path === 'rotation') {   // quaternions are normalised
 		const len = Math.hypot(...out);
 		return out.map(v => v / len);
 	}
 	return out;
 }
 
-/** Матрица поворота вокруг точки: T(p) · R(q) · T(−p). */
+/** Rotation matrix about a point: T(p) · R(q) · T(−p). */
 function rotateAround(pivot, q) {
 	const T = p => matFromTRS(p, [0, 0, 0, 1], [1, 1, 1]);
 	return matMul(matMul(T(pivot), matFromTRS([0, 0, 0], q, [1, 1, 1])), T(pivot.map(v => -v)));
 }
 
 const MODES = ['local', 'model', 'absolute', 'skip', 'rt'];
-// Как Blockbench складывает сдвиг с поворотом кости, мы не знаем:
-// 'TR' — сдвиг снаружи (как локальная матрица THREE), 'RT' — сдвиг внутри
-// поворота. От этого зависит, что именно надо записывать.
+// How Blockbench combines an offset with a bone rotation is unknown to us:
+// 'TR' — the offset outside (like a THREE local matrix), 'RT' — the offset inside
+// the rotation. What has to be written depends on it.
 const COMPOSE = ['TR', 'RT'];
 const ORDERS = [false, true];   // preMultiply
 
-// Сводим по ВСЕМ анимациям и нескольким моментам времени: на одной анимации
-// в одной точке нужную комбинацию не отличить — половина вариантов даёт ноль
-// по совпадению.
+// Summed over ALL animations and several moments in time: on one animation at
+// one point the right combination cannot be told apart — half of the variants
+// give zero by coincidence.
 const TIMES = [0, 0.17, 0.33, 0.5, 0.75, 1.0];
 const totals = new Map();
 
@@ -110,9 +110,9 @@ for (const anim of parsed.animations) {
 
 const rows = [...totals.entries()].sort((a, b) => a[1].worst - b[1].worst);
 console.log('');
-console.log('Сводка по всем анимациям и 6 моментам времени:');
+console.log('Summary across all animations and 6 moments in time:');
 console.log('');
-console.log('сборка режим     формула      худший промах  где');
+console.log('build  mode      formula      worst miss     where');
 for (const [key, v] of rows) {
 	const tag = v.worst < 0.01 ? '✅' : v.worst < 1 ? '  ' : '❌';
 	console.log(`${tag} ${key}  ${v.worst.toFixed(3).padStart(10)} px  ${v.where}`);

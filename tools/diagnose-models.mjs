@@ -1,22 +1,22 @@
 /**
- * Диагностика распакованных моделей: что именно в них не так.
+ * Diagnostics of unpacked models: what exactly is wrong with them.
  *
- * Журнал говорит «сломаны текстуры» или «модель сломана», но не говорит почему.
- * Этот инструмент прогоняет настоящий разбор плагина по папкам с моделями
- * и печатает признаки, по которым видно причину.
+ * The journal says "textures broken" or "model broken", but not why.
+ * This tool runs the plugin's real parser over the model folders
+ * and prints the signs that reveal the cause.
  *
- * Запуск: node tools/diagnose-models.mjs <папка с распакованными моделями>
- * Внутри ожидается <папка>/<категория>/<модель>/… либо <папка>/<модель>/…
+ * Run: node tools/diagnose-models.mjs <folder with unpacked models>
+ * Expected inside: <folder>/<category>/<model>/… or <folder>/<model>/…
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const { parseGLTFFiles, solveBox, splitComponents, isDegenerate, imageSize } = require('../plugin/geckolib_model_importer.js');
+const { parseGLTFFiles, solveBox, splitComponents, isDegenerate, imageSize } = require('../plugin/gltf_to_minecraft.js');
 
 const root = process.argv[2];
-if (!root) { console.log('Укажите папку с распакованными моделями'); process.exit(1); }
+if (!root) { console.log('Specify a folder with unpacked models'); process.exit(1); }
 
 const readDir = dir => {
 	const files = {};
@@ -31,7 +31,7 @@ const readDir = dir => {
 	return files;
 };
 
-/** Папки, внутри которых лежит модель (есть .gltf/.glb или вложенные файлы). */
+/** Folders that hold a model (there is a .gltf/.glb or nested files). */
 const modelDirs = [];
 const collect = (dir, depth) => {
 	const entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -53,16 +53,16 @@ for (const dir of modelDirs) {
 		const other = names.filter(n => /\.(blend|blend1|fbx|obj|max|ma|mb|c4d|3ds|dae)$/i.test(n))
 			.map(n => path.extname(n)).join(', ');
 		console.log(`\n### ${label}`);
-		console.log(`    НЕТ glTF. В архиве только исходник автора: ${other || names.slice(0, 3).join(', ')}`);
-		console.log('    → это выгрузка «Original», а не автоконверсия. Открыть нечем.');
+		console.log(`    NO glTF. The archive holds only the author's source: ${other || names.slice(0, 3).join(', ')}`);
+		console.log('    → this is the "Original" download, not the autoconversion. Nothing can open it.');
 		continue;
 	}
 
 	let parsed;
 	try { parsed = parseGLTFFiles(files, { scale: 1, uvWidth: 1, uvHeight: 1 }); }
-	catch (e) { console.log(`\n### ${label}\n    разбор упал: ${e.message}`); continue; }
+	catch (e) { console.log(`\n### ${label}\n    parsing crashed: ${e.message}`); continue; }
 
-	// разбиение слитых мешей — так же, как в импорте
+	// splitting merged meshes — the same way as in the import
 	const split = [];
 	let splitFrom = 0;
 	for (const obj of parsed.objects) {
@@ -71,7 +71,7 @@ for (const dir of modelDirs) {
 		parts.forEach(faces => split.push({ name: obj.name, faces, image: obj.image }));
 	}
 
-	// классификация объектов
+	// classifying the objects
 	let boxes = 0, degenerate = 0;
 	const notBox = [];
 	for (const o of split) {
@@ -83,7 +83,7 @@ for (const dir of modelDirs) {
 		notBox.push({ name: o.name, verts: pts.size });
 	}
 
-	// текстуры и UV
+	// textures and UV
 	const roles = parsed.images.map(i => i.role || '?');
 	const colorCount = roles.filter(r => r === 'color').length;
 	const auxCount = roles.filter(r => r === 'aux').length;
@@ -98,30 +98,30 @@ for (const dir of modelDirs) {
 		}
 	}
 
-	// насколько объекты вообще похожи на ящики
+	// how box-like the objects are at all
 	const heavy = notBox.filter(n => n.verts > 12).length;
 	const near = notBox.length - heavy;
 	const total = boxes + notBox.length;
 	const share = total ? (100 * notBox.length / total) : 0;
 
 	console.log(`\n### ${label}`);
-	console.log(`    объектов ${parsed.objects.length} → после разделения ${split.length}`
-		+ (splitFrom ? ` (разделено мешей: ${splitFrom})` : ''));
-	console.log(`    ящики ${boxes} · не-ящики ${notBox.length} (${share.toFixed(0)}%) `
-		+ `· вырожденные ${degenerate}`);
+	console.log(`    objects ${parsed.objects.length} → after splitting ${split.length}`
+		+ (splitFrom ? ` (meshes split: ${splitFrom})` : ''));
+	console.log(`    boxes ${boxes} · not boxes ${notBox.length} (${share.toFixed(0)}%) `
+		+ `· degenerate ${degenerate}`);
 	if (notBox.length) {
-		console.log(`      из не-ящиков: сложная геометрия (>12 вершин) ${heavy}, почти ящик ${near}`);
+		console.log(`      of the not-boxes: complex geometry (>12 vertices) ${heavy}, almost a box ${near}`);
 		const worst = notBox.slice().sort((a, b) => b.verts - a.verts).slice(0, 3);
-		console.log('      самые сложные: ' + worst.map(w => `${w.name} (${w.verts} вершин)`).join(', '));
+		console.log('      most complex: ' + worst.map(w => `${w.name} (${w.verts} vertices)`).join(', '));
 	}
-	console.log(`    картинок ${parsed.images.length}: цветных ${colorCount}, служебных ${auxCount}`
-		+ (unreadable ? `, нечитаемых ${unreadable}` : ''));
-	console.log(`    UV вне текстуры ${uvTotal ? (100 * uvOut / uvTotal).toFixed(1) : 0}%`
-		+ ` · объектов без материала ${noMat}`);
+	console.log(`    images ${parsed.images.length}: colour ${colorCount}, auxiliary ${auxCount}`
+		+ (unreadable ? `, unreadable ${unreadable}` : ''));
+	console.log(`    UV outside the texture ${uvTotal ? (100 * uvOut / uvTotal).toFixed(1) : 0}%`
+		+ ` · objects without a material ${noMat}`);
 
-	const verdict = share > 30 ? 'НЕ КУБИЧЕСКАЯ — замена ящиками даст кашу'
-		: share > 0 ? 'почти кубическая — замена ящиками уместна'
-		: 'кубическая';
-	console.log(`    вывод: ${verdict}`);
+	const verdict = share > 30 ? 'NOT CUBIC — replacing with boxes will make a mess'
+		: share > 0 ? 'almost cubic — replacing with boxes is appropriate'
+		: 'cubic';
+	console.log(`    verdict: ${verdict}`);
 }
 console.log('');

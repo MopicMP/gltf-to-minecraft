@@ -1,12 +1,12 @@
 /**
- * Приближение не-ящиков габаритным ящиком: как ложится текстура.
+ * Approximating not-boxes with a bounding box: how the texture lands.
  *
- * Модели, помеченные «сломанные текстуры», состоят из клиньев и скосов —
- * геометрии, которой в Minecraft не бывает. Форму такой объект теряет
- * неизбежно, но раньше он получал ОДИН прямоугольник UV на все шесть граней,
- * и каждая сторона показывала габарит всей развёртки разом. Отсюда каша.
+ * Models marked "broken textures" are made of wedges and bevels —
+ * geometry Minecraft does not have. Such an object loses its shape
+ * inevitably, but it used to get ONE UV rectangle for all six faces,
+ * and every side showed the bounds of the whole unwrap at once. Hence the mess.
  *
- * Запуск: node tools/verify-approx.mjs [папка с распакованными моделями]
+ * Run: node tools/verify-approx.mjs [folder with unpacked models]
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -14,51 +14,51 @@ import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
 const { boxFromBounds, triangleNormal, solveBox, splitComponents, parseGLTFFiles } =
-	require('../plugin/geckolib_model_importer.js');
+	require('../plugin/gltf_to_minecraft.js');
 
 let bad = 0;
 const ok = (cond, msg) => { if (!cond) bad++; console.log(`  ${cond ? '✅' : '❌'} ${msg}`); };
 
-// ------------------------------------------------------------ нормаль
+// ------------------------------------------------------------ normal
 
-console.log('\n=== Нормаль треугольника ===');
+console.log('\n=== Triangle normal ===');
 const n1 = triangleNormal([[0, 0, 0], [1, 0, 0], [0, 1, 0]]);
-ok(n1 && Math.abs(n1[2] - 1) < 1e-9, 'треугольник в плоскости XY смотрит по +Z');
-ok(!triangleNormal([[0, 0, 0], [1, 0, 0], [2, 0, 0]]), 'вырожденный треугольник даёт null');
-ok(!triangleNormal([[0, 0, 0], [1, 0, 0]]), 'двух точек мало');
+ok(n1 && Math.abs(n1[2] - 1) < 1e-9, 'a triangle in the XY plane faces +Z');
+ok(!triangleNormal([[0, 0, 0], [1, 0, 0], [2, 0, 0]]), 'a degenerate triangle gives null');
+ok(!triangleNormal([[0, 0, 0], [1, 0, 0]]), 'two points are not enough');
 
-// ------------------------------------------------- UV раскладываются по граням
+// ------------------------------------------------- UV laid out per face
 
-console.log('\n=== Клин: каждой грани свой кусок текстуры ===');
+console.log('\n=== Wedge: every face gets its own piece of texture ===');
 
-// клин: снизу квадрат, сверху скошено — ровно то, что встречается в моделях
+// a wedge: a square at the bottom, bevelled at the top — exactly what models contain
 const quad = (p0, p1, p2, p3, uv0, uv1, uv2, uv3) => ([
 	{ positions: [p0, p1, p2], uvs: [uv0, uv1, uv2] },
 	{ positions: [p0, p2, p3], uvs: [uv0, uv2, uv3] },
 ]);
-// Обход вершин задаёт направление нормали, поэтому у каждой грани он свой:
-// низ обходится так, чтобы нормаль смотрела вниз, и так далее.
+// The vertex winding sets the normal's direction, so each face has its own:
+// the bottom is wound so that its normal points down, and so on.
 const wedge = [
-	// низ: нормаль -Y
+	// bottom: normal -Y
 	...quad([0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1], [0, 0], [0.1, 0], [0.1, 0.1], [0, 0.1]),
-	// верх: нормаль +Y
+	// top: normal +Y
 	...quad([0, 1, 0], [0, 1, 1], [1, 1, 1], [1, 1, 0], [0.5, 0.5], [0.5, 0.6], [0.6, 0.6], [0.6, 0.5]),
-	// перед: нормаль -Z
+	// front: normal -Z
 	...quad([0, 0, 0], [0, 1, 0], [1, 1, 0], [1, 0, 0], [0.2, 0.2], [0.2, 0.3], [0.3, 0.3], [0.3, 0.2]),
 ];
 const sol = boxFromBounds(wedge);
-ok(!!sol && sol.approximated, 'габаритный ящик построен и помечен приближённым');
+ok(!!sol && sol.approximated, 'bounding box built and marked as approximated');
 
 const rects = Object.entries(sol.faceUV).map(([k, v]) => [k, v.join(',')]);
 const unique = new Set(rects.map(r => r[1]));
-ok(unique.size > 1, `у граней разные прямоугольники UV (различных: ${unique.size})`);
-ok(sol.faceUV.down.join(',') === '0,0,0.1,0.1', `низ взял свой кусок: ${sol.faceUV.down.join(',')}`);
-ok(sol.faceUV.up.join(',') === '0.5,0.5,0.6,0.6', `верх взял свой кусок: ${sol.faceUV.up.join(',')}`);
-ok(sol.faceUV.north.join(',') === '0.2,0.2,0.3,0.3', `перед взял свой кусок: ${sol.faceUV.north.join(',')}`);
-// грани без треугольников достаётся общий габарит — пустой стороны быть не должно
-ok(sol.faceUV.east.join(',') === '0,0,0.6,0.6', 'грань без своих треугольников берёт общий габарит');
+ok(unique.size > 1, `faces have different UV rectangles (distinct: ${unique.size})`);
+ok(sol.faceUV.down.join(',') === '0,0,0.1,0.1', `bottom took its own piece: ${sol.faceUV.down.join(',')}`);
+ok(sol.faceUV.up.join(',') === '0.5,0.5,0.6,0.6', `top took its own piece: ${sol.faceUV.up.join(',')}`);
+ok(sol.faceUV.north.join(',') === '0.2,0.2,0.3,0.3', `front took its own piece: ${sol.faceUV.north.join(',')}`);
+// a face without triangles gets the overall bounds — no side may be left empty
+ok(sol.faceUV.east.join(',') === '0,0,0.6,0.6', 'a face without its own triangles takes the overall bounds');
 
-// ------------------------------------------------- на настоящих моделях
+// ------------------------------------------------- on real models
 
 const root = process.argv[2];
 if (root && fs.existsSync(root)) {
@@ -75,7 +75,7 @@ if (root && fs.existsSync(root)) {
 		return files;
 	};
 
-	console.log('\n=== Настоящие модели с жалобой «сломаны текстуры» ===');
+	console.log('\n=== Real models reported as "broken textures" ===');
 	const dirs = [];
 	const collect = d => {
 		const es = fs.readdirSync(d, { withFileTypes: true });
@@ -99,10 +99,10 @@ if (root && fs.existsSync(root)) {
 			}
 		}
 		if (!approx) continue;
-		console.log(`  ${path.relative(root, dir).replace(/[\/]source$/, "").padEnd(38)} приближено ${String(approx).padStart(4)}: `
-			+ `с разными UV по граням ${String(distinct).padStart(4)}, с одинаковыми ${single}`);
+		console.log(`  ${path.relative(root, dir).replace(/[\/]source$/, "").padEnd(38)} approximated ${String(approx).padStart(4)}: `
+			+ `with different UV per face ${String(distinct).padStart(4)}, with identical ${single}`);
 	}
 }
 
-console.log(bad ? `\n❌ ОШИБОК: ${bad}\n` : '\n✅ ПРИБЛИЖЕНИЕ РАСКЛАДЫВАЕТ UV ПО ГРАНЯМ\n');
+console.log(bad ? `\n❌ ERRORS: ${bad}\n` : '\n✅ APPROXIMATION LAYS UV OUT PER FACE\n');
 process.exit(bad ? 1 : 0);

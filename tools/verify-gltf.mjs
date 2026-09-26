@@ -1,22 +1,22 @@
 /**
- * Проверяет разбор glTF: парсит все три варианта из test-fixtures и сверяет
- * результат solveBox с эталоном, полученным напрямую из OBJ.
+ * Checks glTF parsing: parses all three variants from test-fixtures and compares
+ * the solveBox result with a reference taken straight from the OBJ.
  *
- * Расхождений быть не должно — геометрия та же самая, меняется только упаковка.
+ * There must be no differences — the geometry is the same, only the packaging changes.
  *
- * Запуск: node tools/verify-gltf.mjs model/model.obj
+ * Run: node tools/verify-gltf.mjs model/model.obj
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const { solveBox, parseGLTFFiles } = require('../plugin/geckolib_model_importer.js');
+const { solveBox, parseGLTFFiles } = require('../plugin/gltf_to_minecraft.js');
 
 const src = process.argv[2] ?? 'model/model.obj';
 const TEX = 128;
 
-// ---------------------------------------------- эталон: тот же путь, что и раньше
+// ---------------------------------------------- reference: the same path as before
 
 const positions = [], uvs = [], objects = [];
 let cur = null;
@@ -32,7 +32,7 @@ for (const raw of fs.readFileSync(src, 'utf8').split('\n')) {
 		for (let i = 1; i + 1 < c.length; i++) {
 			const tri = [c[0], c[i], c[i + 1]];
 			cur.faces.push({
-				// эталон приводим к тому же масштабу, что и glTF: пиксели
+				// the reference is brought to the same scale as glTF: pixels
 				positions: tri.map(x => positions[x.v].map(v => v * 16)),
 				uvs: tri.map(x => x.t < 0 ? null : [uvs[x.t][0] * TEX, (1 - uvs[x.t][1]) * TEX]),
 			});
@@ -45,9 +45,9 @@ for (const o of objects) {
 	const s = solveBox(o.faces);
 	if (!s.error) baseline.set(o.name, s);
 }
-console.log(`\nЭталон из OBJ: ${baseline.size} объектов\n`);
+console.log(`\nReference from OBJ: ${baseline.size} objects\n`);
 
-// ------------------------------------------------------------- сверка вариантов
+// ------------------------------------------------------------- comparing the variants
 
 function loadDir(dir) {
 	const files = {};
@@ -62,13 +62,13 @@ const near = (a, b, tol) => Math.abs(a - b) <= tol;
 let allOk = true;
 for (const variant of ['external', 'embedded', 'glb']) {
 	const dir = path.join('test-fixtures', variant);
-	if (!fs.existsSync(dir)) { console.log(`${variant.padEnd(9)} — нет фикстур, пропуск`); continue; }
+	if (!fs.existsSync(dir)) { console.log(`${variant.padEnd(9)} — no fixtures, skipped`); continue; }
 
 	let parsed;
 	try {
 		parsed = parseGLTFFiles(loadDir(dir), { scale: 16, uvWidth: TEX, uvHeight: TEX });
 	} catch (e) {
-		console.log(`${variant.padEnd(9)} ❌ разбор упал: ${e.message}`);
+		console.log(`${variant.padEnd(9)} ❌ parsing crashed: ${e.message}`);
 		allOk = false;
 		continue;
 	}
@@ -77,7 +77,7 @@ for (const variant of ['external', 'embedded', 'glb']) {
 	const problems = [];
 	for (const obj of parsed.objects) {
 		const want = baseline.get(obj.name);
-		if (!want) { problems.push(`${obj.name}: нет в эталоне`); bad++; continue; }
+		if (!want) { problems.push(`${obj.name}: not in the reference`); bad++; continue; }
 		const got = solveBox(obj.faces);
 		if (got.error) { problems.push(`${obj.name}: ${got.error}`); bad++; continue; }
 
@@ -89,16 +89,16 @@ for (const variant of ['external', 'embedded', 'glb']) {
 			const a = want.faceUV[f], b = got.faceUV[f];
 			if (!b || !a.every((v, i) => near(v, b[i], 0.01))) ok = false;
 		}
-		if (ok) matched++; else { bad++; problems.push(`${obj.name}: расходится с эталоном`); }
+		if (ok) matched++; else { bad++; problems.push(`${obj.name}: differs from the reference`); }
 	}
 
 	const status = bad === 0 && matched === baseline.size ? '✅' : '❌';
 	if (bad) allOk = false;
-	console.log(`${variant.padEnd(9)} ${status} объектов ${parsed.objects.length}, совпало ${matched}, расхождений ${bad}`
-		+ (parsed.warnings.length ? `, предупреждений ${parsed.warnings.length}` : '')
-		+ (parsed.images.length ? `, текстуры: ${parsed.images.map(i => i.name).join(', ')}` : ''));
+	console.log(`${variant.padEnd(9)} ${status} objects ${parsed.objects.length}, matched ${matched}, differences ${bad}`
+		+ (parsed.warnings.length ? `, warnings ${parsed.warnings.length}` : '')
+		+ (parsed.images.length ? `, textures: ${parsed.images.map(i => i.name).join(', ')}` : ''));
 	for (const p of problems.slice(0, 5)) console.log(`            ${p}`);
 }
 
-console.log(`\n${allOk ? '✅ РАЗБОР glTF СОВПАДАЕТ С ЭТАЛОНОМ' : '❌ ЕСТЬ РАСХОЖДЕНИЯ'}\n`);
+console.log(`\n${allOk ? '✅ glTF PARSING MATCHES THE REFERENCE' : '❌ THERE ARE DIFFERENCES'}\n`);
 process.exit(allOk ? 0 : 1);

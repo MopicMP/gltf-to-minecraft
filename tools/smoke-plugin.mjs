@@ -1,22 +1,22 @@
 /**
- * Дымовой тест: прогоняет ВЕСЬ путь импорта с подменёнными объектами Blockbench.
+ * Smoke test: runs the WHOLE import path with Blockbench objects stubbed out.
  *
- * Зачем: `node --check` ловит только синтаксис. Ошибки вида «обращение к const
- * до объявления», опечатки в именах и вызовы несуществующих функций видны лишь
- * при исполнении — и до сих пор доезжали до пользователя. Здесь код реально
- * выполняется, поэтому такие ошибки падают тут.
+ * Why: `node --check` only catches syntax. Errors like "access to a const
+ * before its declaration", typos in names and calls to functions that do not exist show up only
+ * at run time — and used to reach the user. Here the code actually
+ * runs, so such errors fail here.
  *
- * Числовая точность не важна: математика покрыта отдельными тестами. В частности,
- * калибровка UV в песочнице выдаёт бессмысленные значения — геометрия пробного
- * куба здесь синтетическая. Проверяется, что код ОТРАБАТЫВАЕТ, а не что он прав.
+ * Numerical accuracy does not matter: the maths is covered by separate tests. In particular,
+ * UV calibration in the sandbox yields meaningless values — the probe cube's geometry
+ * is synthetic here. What is checked is that the code RUNS, not that it is right.
  *
- * Запуск: node tools/smoke-plugin.mjs
+ * Run: node tools/smoke-plugin.mjs
  */
 import fs from 'node:fs';
 import vm from 'node:vm';
 import path from 'node:path';
 
-// ------------------------------------------------------------ мини-THREE
+// ------------------------------------------------------------ mini-THREE
 
 const clamp = v => Math.min(1, Math.max(-1, v));
 
@@ -38,7 +38,7 @@ class Quaternion {
 class Euler {
 	constructor(x = 0, y = 0, z = 0, order = 'XYZ') { Object.assign(this, { x, y, z, order }); }
 	setFromQuaternion(q, order) {
-		// через матрицу, как в THREE
+		// through a matrix, as in THREE
 		const { x, y, z, w } = q;
 		const m = [
 			1 - 2 * (y * y + z * z), 2 * (x * y + z * w), 2 * (x * z - y * w),
@@ -90,7 +90,7 @@ const THREE = {
 	MathUtils: { radToDeg: r => r * 180 / Math.PI, degToRad: d => d * Math.PI / 180 },
 };
 
-// ------------------------------------------------- подмена объектов Blockbench
+// ------------------------------------------------- stubbing the Blockbench objects
 
 const created = { cubes: [], groups: [], animations: [], textures: [] };
 let reportShown = null;
@@ -106,7 +106,7 @@ class Cube {
 		this.faces = {};
 		for (const f of ['north', 'south', 'east', 'west', 'up', 'down']) this.faces[f] = { uv: null, texture: null };
 		this.mesh = new FakeMeshObj();
-		// геометрия куба 24 вершины — как её отдаёт Blockbench, относительно origin
+		// cube geometry of 24 vertices — the way Blockbench gives it, relative to origin
 		const pos = [], uv = [];
 		const h = [8, 8, 8];
 		const faces = [[0, 1], [0, -1], [1, 1], [1, -1], [2, 1], [2, -1]];
@@ -150,7 +150,7 @@ class BoneAnimator {
 	displayFrame() { }
 	createKeyframe(data, time, channel) {
 		if (!data || [data.x, data.y, data.z].some(v => typeof v !== 'number' || !isFinite(v))) {
-			problems.push(`нечисловой кадр в канале ${channel}: ${JSON.stringify(data)}`);
+			problems.push(`non-numeric keyframe in channel ${channel}: ${JSON.stringify(data)}`);
 		}
 		const kf = { data, time, channel };
 		(this[channel] || (this[channel] = [])).push(kf);
@@ -179,15 +179,19 @@ class Texture {
 Object.defineProperty(Texture, 'all', { get: () => created.textures });
 
 
-// ------------------------------------------------------- содержимое архива
+// ------------------------------------------------------- archive contents
 
-// Сценарий подменяется между прогонами: так один и тот же путь импорта
-// проверяется на PNG и на JPEG. Второй случай важнее — на Sketchfab текстуры
-// почти всегда JPEG, и пока плагин понимал только PNG, такие архивы падали
-// с «текстура не найдена», не дойдя до геометрии.
+// The scenario is swapped between runs: that way one and the same import path
+// is checked on PNG and on JPEG. The second case matters more — on Sketchfab textures
+// are almost always JPEG, and while the plugin understood only PNG, such archives failed
+// with "texture not found" before reaching the geometry.
 let scenario = 'png';
 
-/** Минимальный JPEG: заголовка достаточно, декодировать его тут некому. */
+// What fills the file map: unpacking an archive or picking the files of a folder.
+// For everything below the parser there is no difference — the map is the same.
+let importMode = 'zip';
+
+/** A minimal JPEG: the header is enough, there is nobody here to decode it. */
 function fakeJPEG(w, h) {
     const be = n => [(n >> 8) & 0xFF, n & 0xFF];
     return Uint8Array.from([
@@ -198,10 +202,80 @@ function fakeJPEG(w, h) {
     ]);
 }
 
+/**
+ * A minimal PNG: the signature and IHDR are enough, the size is read from the header.
+ * The colour type matters on its own: 6 is RGBA, 2 is RGB without alpha.
+ */
+function fakePNG(w, h, colorType = 6) {
+    const be = n => [(n >>> 24) & 0xFF, (n >>> 16) & 0xFF, (n >>> 8) & 0xFF, n & 0xFF];
+    return Uint8Array.from([
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+        ...be(13), 0x49, 0x48, 0x44, 0x52,
+        ...be(w), ...be(h), 8, colorType, 0, 0, 0,
+    ]);
+}
+
 function zipContents() {
     const gltfPath = 'model(gltf)/source/model.gltf';
     const texPath = 'model(gltf)/textures/gltf_embedded_0.png';
     const files = {};
+
+    // An image no primitive looks at. That is how all three reference models
+    // with several textures are built: the file declares one material per
+    // image, yet every primitive carries material 0, and the other images
+    // end up unreachable. There is no point packing them into the atlas — twelve such
+    // images made 512x256 where the whole visible model fits into 32x32.
+    if (scenario === 'unused') {
+        const gltf = JSON.parse(fs.readFileSync(gltfPath, 'utf8'));
+        const spare = (gltf.images || []).length;
+        gltf.images = [...(gltf.images || []), { uri: 'textures/spare.png' }];
+        gltf.textures = [...(gltf.textures || []), { source: spare }];
+        gltf.materials = [...(gltf.materials || []),
+            { pbrMetallicRoughness: { baseColorTexture: { index: gltf.textures.length - 1 } } }];
+
+        files['source/model.gltf'] = new Uint8Array(Buffer.from(JSON.stringify(gltf), 'utf8'));
+        files['textures/gltf_embedded_0.png'] = new Uint8Array(fs.readFileSync(texPath));
+        files['textures/spare.png'] = fakePNG(256, 256);
+        return files;
+    }
+
+    // Objects that name no image at all. In one test model all 533 primitives
+    // hang on a material without a baseColorTexture, so nobody reaches an image.
+    // Without a rectangle the UV get multiplied by the project texture size — that is,
+    // by the whole atlas — and the model arrives in a stretched mix of every image at once.
+    if (scenario === 'nomaterial') {
+        const gltf = JSON.parse(fs.readFileSync(gltfPath, 'utf8'));
+        const spare = (gltf.images || []).length;
+        gltf.images = [...(gltf.images || []), { uri: 'textures/spare.png' }];
+        gltf.textures = [...(gltf.textures || []), { source: spare }];
+        gltf.materials = [...(gltf.materials || []),
+            { pbrMetallicRoughness: { baseColorTexture: { index: gltf.textures.length - 1 } } }];
+        for (const mesh of gltf.meshes || []) {
+            for (const prim of mesh.primitives || []) delete prim.material;
+        }
+
+        files['source/model.gltf'] = new Uint8Array(Buffer.from(JSON.stringify(gltf), 'utf8'));
+        files['textures/gltf_embedded_0.png'] = new Uint8Array(fs.readFileSync(texPath));
+        files['textures/spare.png'] = fakePNG(256, 256);
+        return files;
+    }
+
+    // The material asks for transparency, and the image does not carry it. Nine
+    // reference models out of ten are like that: the alpha was lost on download, and the outer
+    // shell of the figure turned from transparent to solid. The coordinates are right to the
+    // pixel meanwhile — which is why this has to be named out loud rather than fixed by a guess.
+    if (scenario === 'noalpha') {
+        const gltf = JSON.parse(fs.readFileSync(gltfPath, 'utf8'));
+        for (const m of gltf.materials || []) m.alphaMode = 'BLEND';
+        gltf.images = [{ uri: 'textures/flat.png' }];
+        gltf.textures = [{ source: 0 }];
+        for (const m of gltf.materials || []) {
+            m.pbrMetallicRoughness = { ...(m.pbrMetallicRoughness || {}), baseColorTexture: { index: 0 } };
+        }
+        files['source/model.gltf'] = new Uint8Array(Buffer.from(JSON.stringify(gltf), 'utf8'));
+        files['textures/flat.png'] = fakePNG(128, 128, 2);   // RGB, no alpha
+        return files;
+    }
 
     if (scenario === 'png') {
         files['source/model.gltf'] = new Uint8Array(fs.readFileSync(gltfPath));
@@ -209,10 +283,10 @@ function zipContents() {
         return files;
     }
 
-    // JPEG под именем .png плюс нечитаемая картинка ПЕРВЫМ номером. Порядок
-    // выбран нарочно: объекты ссылаются на картинку номером из glTF, а из
-    // атласа нечитаемая выпадает — если номера не пересчитывать, каждому
-    // объекту достанется чужой кусок текстуры, и молча.
+    // A JPEG under a .png name plus an unreadable image as the FIRST index. The order
+    // is chosen on purpose: objects refer to an image by its glTF index, and the
+    // unreadable one drops out of the atlas — if the indices are not renumbered, every
+    // object gets someone else's piece of texture, silently.
     const gltf = JSON.parse(fs.readFileSync(gltfPath, 'utf8'));
     gltf.images = [{ uri: 'textures/broken.tga' }, ...(gltf.images || [])];
     for (const t of gltf.textures || []) if (t.source !== undefined) t.source += 1;
@@ -224,8 +298,8 @@ function zipContents() {
 }
 
 
-// Псевдо-DOM окна отчёта: проверяем, что кнопки «Сохранить лог» и
-// «Скопировать» находятся по своим классам и обработчики вешаются.
+// A pseudo-DOM for the report window: checks that the "Save log" and
+// "Copy" buttons are found by their classes and the handlers get attached.
 const foundSelectors = [];
 function fakeDialogRoot(html) {
 	return {
@@ -238,6 +312,7 @@ function fakeDialogRoot(html) {
 }
 
 const sandboxActions = [];
+const menuPlacement = {};
 let zipWritten = null;
 let exported = null;
 
@@ -262,18 +337,20 @@ const sandbox = {
 		constructor(id, opts) { Object.assign(this, opts); this.id = id; sandboxActions.push(this); }
 		delete() { }
 	},
-	MenuBar: { addAction() { } },
+	// Records where the plugin puts its entries: the catalog maintainer asked to
+	// move them from the bottom of the File menu into File > Import, and undoing that must be caught.
+	MenuBar: { addAction(action, where) { menuPlacement[action.id] = where; } },
 	Dialog: class {
 		constructor(opts) { Object.assign(this, opts); }
 		show() {
-			// Окно отчёта формы не имеет: у него готовая разметка в lines.
-			// Её тоже надо проверять — именно туда переехал отчёт импорта.
+			// The report window has no form: it has ready-made markup in lines.
+			// That has to be checked too — it is where the import report moved.
 			if (this.lines && this.lines.length) {
 				reportShown = this.lines.join(String.fromCharCode(10));
 				this.object = fakeDialogRoot(reportShown);
 				return;
 			}
-			// сразу подтверждаем со значениями по умолчанию
+			// confirm at once with the default values
 			const form = {};
 			for (const [k, v] of Object.entries(this.form || {})) {
 				if (v.type === 'checkbox') form[k] = v.value;
@@ -290,11 +367,24 @@ const sandbox = {
 		showQuickMessage() { },
 		addCSS: () => ({ delete() { } }),
 		on() { }, removeListener() { },
-		import(opts, cb) { cb([{ name: 'model(gltf).zip', content: null }]); },
+		// Picking files: either one archive or a set of files from an unpacked folder.
+		// The second case is a separate branch in the plugin, and without it the branch would reach
+		// the user unchecked. The names are deliberately without paths: that is how the file
+		// picker hands them over, and that is what the glTF refers to from inside.
+		import(opts, cb) {
+			if (importMode === 'files') {
+				cb(Object.entries(zipContents()).map(([name, bytes]) => ({
+					name: name.replace(/^.*[/\\]/, ''),
+					content: bytes,
+				})));
+				return;
+			}
+			cb([{ name: 'model(gltf).zip', content: null }]);
+		},
 		export(opts) { exported = opts; },
 	},
-	// Класс, а не объект: экспорт в CPM собирает архив через `new JSZip()`,
-	// а импорт распаковывает через статический loadAsync.
+	// A class, not an object: the CPM export assembles an archive through `new JSZip()`,
+	// and the import unpacks through the static loadAsync.
 	JSZip: class {
 		constructor() { this.files = {}; }
 		file(name, data) { this.files[name] = data; }
@@ -303,7 +393,7 @@ const sandbox = {
 			return Promise.resolve(new ArrayBuffer(8));
 		}
 		static loadAsync() {
-			// настоящую распаковку не проверяем — подкладываем файлы с диска
+			// real unpacking is not tested — files from disk are slipped in
 			return Promise.resolve({
 				forEach(cb) {
 					for (const [name, bytes] of Object.entries(zipContents())) {
@@ -325,46 +415,67 @@ const sandbox = {
 	},
 	Image: class { set src(v) { this._src = v; setTimeout(() => this.onload && this.onload(), 0); } },
 	localStorage: { _v: {}, getItem(k) { return this._v[k] || null; }, setItem(k, v) { this._v[k] = v; } },
-	fetch: () => Promise.reject(new Error('сеть в тесте отключена')),
+	fetch: () => Promise.reject(new Error('network is disabled in the test')),
 };
 sandbox.window = sandbox;
 sandbox.globalThis = sandbox;
 
-// ------------------------------------------------------------------- прогон
+// ------------------------------------------------------------------- run
 
-const src = fs.readFileSync(path.join('plugin', 'geckolib_model_importer.js'), 'utf8');
+const src = fs.readFileSync(path.join('plugin', 'gltf_to_minecraft.js'), 'utf8');
 vm.createContext(sandbox);
 
 let failed = false;
 try {
-	new vm.Script(src, { filename: 'geckolib_model_importer.js' }).runInContext(sandbox);
+	new vm.Script(src, { filename: 'gltf_to_minecraft.js' }).runInContext(sandbox);
 } catch (e) {
-	console.log(`\n❌ Плагин упал при загрузке: ${e.message}\n${e.stack.split('\n').slice(1, 3).join('\n')}`);
+	console.log(`\n❌ The plugin crashed on load: ${e.message}\n${e.stack.split('\n').slice(1, 3).join('\n')}`);
 	process.exit(1);
 }
 
 const plugin = sandbox.__plugin;
-if (!plugin) { console.log('\n❌ Plugin.register не вызван\n'); process.exit(1); }
+if (!plugin) { console.log('\n❌ Plugin.register was not called\n'); process.exit(1); }
 
 try {
 	plugin.onload();
 } catch (e) {
-	console.log(`\n❌ onload упал: ${e.message}\n${e.stack.split('\n').slice(1, 3).join('\n')}`);
+	console.log(`\n❌ onload crashed: ${e.message}\n${e.stack.split('\n').slice(1, 3).join('\n')}`);
 	process.exit(1);
 }
 
 console.log('');
-console.log('=== ДЫМОВОЙ ТЕСТ ПЛАГИНА ===');
+console.log('=== PLUGIN SMOKE TEST ===');
 console.log('');
-console.log('Плагин загрузился и onload отработал: OK');
-console.log(`Зарегистрировано действий: ${sandboxActions.length}`);
+console.log('The plugin loaded and onload ran: OK');
+console.log(`Actions registered: ${sandboxActions.length}`);
 
-// Запускаем импорт через созданное действие: диалог подтвердится сам,
-// JSZip отдаст файлы с диска. Так проверяется весь путь целиком.
+// The import is run through the created action: the dialog confirms itself,
+// JSZip hands over files from disk. That way the whole path is checked end to end.
 const importAction = sandboxActions.find(a => a.id.endsWith('_import'));
-if (!importAction) { console.log('ОШИБКА: действие импорта не найдено'); process.exit(1); }
+if (!importAction) { console.log('ERROR: import action not found'); process.exit(1); }
 
-/** Один прогон импорта целиком: диалог подтвердится сам, JSZip отдаст фикстуру. */
+// All three entries — import, CPM and the Sketchfab search — must sit in File > Import.
+// In the bare File menu they fell to its very bottom, and the catalog maintainer asked
+// to move them from there.
+{
+    const want = ['_import', '_cpm', '_sketchfab'];
+    const misplaced = want.filter(suffix => {
+        const a = sandboxActions.find(x => x.id.endsWith(suffix));
+        return !a || menuPlacement[a.id] !== 'file.import';
+    });
+    if (misplaced.length) {
+        failed = true;
+        console.log('❌ not in File > Import: ' + misplaced.join(', ')
+            + ' (' + misplaced.map(s => {
+                const a = sandboxActions.find(x => x.id.endsWith(s));
+                return a ? menuPlacement[a.id] : 'no action';
+            }).join(', ') + ')');
+    } else {
+        console.log('All three entries sit in File > Import: OK');
+    }
+}
+
+/** One full import run: the dialog confirms itself, JSZip hands over the fixture. */
 async function runImport(label) {
     created.cubes.length = 0;
     created.groups.length = 0;
@@ -378,7 +489,7 @@ async function runImport(label) {
     try {
         importAction.click();
     } catch (e) {
-        console.log('ОШИБКА при импорте: ' + e.message);
+        console.log('ERROR during import: ' + e.message);
         console.log(String(e.stack).split(String.fromCharCode(10)).slice(1, 4).join(' | '));
         process.exit(1);
     }
@@ -388,40 +499,43 @@ async function runImport(label) {
     if (created.cubes.length) {
         const kf = created.animations.reduce((s, a) =>
             s + Object.values(a.animators).reduce((n, an) => n + an.rotation.length + an.position.length, 0), 0);
-        console.log(`Кубов ${created.cubes.length}, костей ${created.groups.length}, `
-            + `анимаций ${created.animations.length}, кадров ${kf}`);
+        console.log(`Cubes ${created.cubes.length}, bones ${created.groups.length}, `
+            + `animations ${created.animations.length}, keyframes ${kf}`);
     } else {
         bad = true;
-        console.log('❌ ни одного куба не создано');
+        console.log('❌ not a single cube was created');
     }
     if (problems.length) {
         bad = true;
-        console.log(`❌ Проблемы (${problems.length}):`);
+        console.log(`❌ Problems (${problems.length}):`);
         for (const p of problems.slice(0, 5)) console.log('  ' + p);
     }
-    if (reportShown && /не удался|НЕ ПЕРЕНЕСЕНЫ|упал/i.test(reportShown)) {
+    // This check used to look for Russian words, and went dead the day the plugin's
+    // report was translated to English: it could never match again. The report
+    // always says "failed: 0" on a healthy run, so only a non-zero count counts.
+    if (reportShown && /Animations transferred: \d+, failed: [1-9]|not transferred:/.test(reportShown)) {
         bad = true;
-        console.log('❌ Отчёт сообщает об ошибке:' + String.fromCharCode(10) + reportShown.slice(0, 400));
+        console.log('❌ The report says something failed:' + String.fromCharCode(10) + reportShown.slice(0, 400));
     }
     return bad;
 }
 
 const baseline = created.cubes.length;
-failed = await runImport('архив с PNG') || failed;
+failed = await runImport('archive with PNG') || failed;
 const cubesPNG = created.cubes.length;
 void baseline;
 
 scenario = 'jpeg';
-failed = await runImport('архив с JPEG + нечитаемая картинка') || failed;
+failed = await runImport('archive with JPEG + an unreadable image') || failed;
 
 if (created.cubes.length !== cubesPNG) {
     failed = true;
-    console.log(`❌ JPEG дал ${created.cubes.length} кубов вместо ${cubesPNG}`);
+    console.log(`❌ JPEG gave ${created.cubes.length} cubes instead of ${cubesPNG}`);
 }
-// Кнопки окна отчёта должны находиться по своим классам: если разметка и
-// обработчики разъедутся, «Сохранить лог» молча перестанет работать.
-// Раздутый плоский куб не должен показывать боковые грани: до раздутия их
-// площадь была нулевой, а после они проступают полосой растянутого пикселя.
+// The report window buttons must be found by their classes: if the markup and
+// the handlers drift apart, "Save log" will silently stop working.
+// An inflated flat cube must not show its side faces: before inflation their
+// area was zero, and after it they show through as a strip of stretched pixel.
 const AXIS_FACES = [['east', 'west'], ['up', 'down'], ['north', 'south']];
 let flatWithSides = 0, flatInflated = 0;
 for (const c of created.cubes) {
@@ -439,60 +553,165 @@ for (const c of created.cubes) {
 }
 if (flatWithSides) {
 	failed = true;
-	console.log('❌ у раздутых плоских кубов остались боковые грани: ' + flatWithSides);
+	console.log('❌ inflated flat cubes kept their side faces: ' + flatWithSides);
 } else if (!flatInflated) {
-	// Проверка, которой нечего проверять, молчит так же, как исправный код.
-	console.log('⚠ раздутых плоских кубов в фикстуре нет — проверка обводки вхолостую');
+	// A check with nothing to check stays as quiet as working code.
+	console.log('⚠ no inflated flat cubes in the fixture — the outline check ran idle');
 } else {
-	console.log(`Плоские кубы при раздутии не получили боковых граней: OK (проверено ${flatInflated})`);
+	console.log(`Flat cubes got no side faces when inflated: OK (checked ${flatInflated})`);
 }
 
 for (const sel of ['.mtc_rep_save', '.mtc_rep_copy']) {
 	if (!foundSelectors.includes(sel)) {
 		failed = true;
-		console.log('❌ обработчик не навешен на ' + sel);
+		console.log('❌ no handler attached to ' + sel);
 	}
 }
 if (reportShown && reportShown.indexOf('mtc_rep_log') < 0) {
 	failed = true;
-	console.log('❌ в окне отчёта нет прокручиваемого блока лога');
+	console.log('❌ the report window has no scrollable log block');
 }
 
 if (!reportShown || reportShown.indexOf('Images skipped: 1') < 0) {
     failed = true;
-    console.log('❌ в отчёте нет строки о пропущенной картинке (Images skipped)');
+    console.log('❌ the report has no line about the skipped image (Images skipped)');
 } else {
-    console.log('Нечитаемая картинка отмечена в отчёте, номера картинок пересчитаны: OK');
+    console.log('Unreadable image noted in the report, image indices renumbered: OK');
 }
 
-// --- экспорт в CPM: тот же путь, но с сохранением .cpmproject в конце.
-// Ловит то же, что и остальной дымовой тест: обращения к несуществующим полям,
-// опечатки в именах, забытые заглушки Blockbench. Правильность геометрии
-// проверяется отдельно — tools/verify-cpm.mjs.
+// --- an image the geometry does not reach.
+//
+// What is checked is not the atlas size as such, but that no atlas was needed at all:
+// the single reachable image goes the direct path, as with one texture in the
+// archive. And that the report says so — a model that arrives wearing one texture
+// everywhere is otherwise left unexplained.
+scenario = 'unused';
+failed = await runImport('archive with an image nobody refers to') || failed;
+
+if (created.cubes.length !== cubesPNG) {
+    failed = true;
+    console.log(`❌ the extra image changed the parse: ${created.cubes.length} cubes instead of ${cubesPNG}`);
+}
+const atlasNamed = created.textures.filter(t => t.name === 'atlas.png').length;
+if (atlasNamed) {
+    failed = true;
+    console.log('❌ the unreachable image got into the atlas after all');
+} else {
+    console.log('The unreachable image stayed out of the atlas: OK');
+}
+if (!reportShown || reportShown.indexOf('Colour textures no mesh references: 1') < 0) {
+    failed = true;
+    console.log('❌ the report has no line about the image nobody refers to');
+} else {
+    console.log('The report names the image nobody refers to: OK');
+}
+
+// --- objects that name no image at all: the UV must not spread across the atlas.
+//
+// The atlas here is built from two images: 256x256 goes first, our fixture's
+// 128x128 after it, at (256,0). So every UV must lie inside that
+// rectangle. Without the rectangle they would stretch across the full width of 512.
+scenario = 'nomaterial';
+failed = await runImport('archive where objects name no image') || failed;
+
+// The calibration probe cube does not count here: calibrateFaceDirs puts one and the same
+// asymmetric rectangle [0,0,4,8] on each of its faces and measures where
+// it landed. It has nothing to do with the model and lives in its own coordinates.
+const PROBE_UV = '[0,0,4,8]';
+let uvMin = Infinity, uvMax = -Infinity, uvCount = 0;
+for (const c of created.cubes) {
+    for (const f of Object.values(c.faces || {})) {
+        if (!f || !f.uv || f.uv.every(v => v === 0)) continue;
+        if (JSON.stringify(f.uv) === PROBE_UV) continue;
+        uvCount++;
+        uvMin = Math.min(uvMin, f.uv[0], f.uv[2]);
+        uvMax = Math.max(uvMax, f.uv[0], f.uv[2]);
+    }
+}
+if (!uvCount) {
+    failed = true;
+    console.log('❌ nothing to check: not a single face with UV');
+} else if (uvMax > 384.5 || uvMin < 255.5) {
+    failed = true;
+    console.log(`❌ UV of objects without a material spread across the atlas: ${uvMin.toFixed(1)}..${uvMax.toFixed(1)}`
+        + ' instead of 256..384');
+} else {
+    console.log(`UV of objects without a material landed in the main image's rectangle: OK `
+        + `(${uvMin.toFixed(1)}..${uvMax.toFixed(1)} of 256..384)`);
+}
+
+// --- the same model, but as files of an unpacked folder rather than an archive.
+//
+// This checks an entry point that did not exist before: names come without paths, and the .bin and
+// images must be found by the bare file name. The result must match the
+// archive one down to the cube — otherwise the way in changes something, and it must not.
+scenario = 'png';
+importMode = 'files';
+failed = await runImport('files of an unpacked folder, no archive') || failed;
+
+if (created.cubes.length !== cubesPNG) {
+    failed = true;
+    console.log(`❌ the folder gave ${created.cubes.length} cubes instead of ${cubesPNG}`);
+} else {
+    console.log(`The folder gave the same result as the archive: OK (${cubesPNG} cubes)`);
+}
+
+// And once more, on a model that refers to its image through a subfolder
+// (`textures/…`), while the file picker hands over a bare name. This is where
+// the lookup by the last path segment works; without it the image is simply not found.
+scenario = 'jpeg';
+failed = await runImport('folder files, where glTF refers through textures/') || failed;
+
+if (created.cubes.length !== cubesPNG) {
+    failed = true;
+    console.log(`❌ the folder gave ${created.cubes.length} cubes instead of ${cubesPNG}`);
+} else if (reportShown && reportShown.indexOf('not found in the archive') >= 0) {
+    failed = true;
+    console.log('❌ the image was not found by its bare name, without the subfolder');
+} else {
+    console.log('Images found by file name, without the path: OK');
+}
+importMode = 'zip';
+
+// --- a texture without alpha where the material asks for it.
+scenario = 'noalpha';
+failed = await runImport('the material asks for transparency, the texture does not carry it') || failed;
+
+if (!reportShown || reportShown.indexOf('without an alpha channel') < 0) {
+    failed = true;
+    console.log('❌ the report has no line about the lost alpha');
+} else {
+    console.log('The report names the lost alpha: OK');
+}
+
+// --- export to CPM: the same path, but saving a .cpmproject at the end.
+// Catches the same as the rest of the smoke test: access to fields that do not exist,
+// typos in names, forgotten Blockbench stubs. Geometric correctness
+// is checked separately — tools/verify-cpm.mjs.
 scenario = 'png';
 zipWritten = null;
 exported = null;
 console.log('');
-console.log('--- экспорт в CPM');
+console.log('--- export to CPM');
 const cpmAction = sandboxActions.find(a => a.id.endsWith('_cpm'));
 if (!cpmAction) {
 	failed = true;
-	console.log('❌ действие экспорта в CPM не найдено');
+	console.log('❌ the CPM export action was not found');
 } else {
 	try {
 		cpmAction.click();
 		await new Promise(r => setTimeout(r, 500));
 	} catch (e) {
 		failed = true;
-		console.log('ОШИБКА при экспорте в CPM: ' + e.message);
+		console.log('ERROR during the CPM export: ' + e.message);
 		console.log(String(e.stack).split(String.fromCharCode(10)).slice(1, 4).join(' | '));
 	}
 	if (!zipWritten) {
 		failed = true;
-		console.log('❌ архив .cpmproject не собран');
+		console.log('❌ the .cpmproject archive was not assembled');
 	} else if (!zipWritten['config.json']) {
 		failed = true;
-		console.log('❌ в архиве нет config.json');
+		console.log('❌ the archive has no config.json');
 	} else {
 		const cfg = JSON.parse(zipWritten['config.json']);
 		const roots = cfg.elements.map(e => e.id).join(', ');
@@ -503,37 +722,37 @@ if (!cpmAction) {
 		});
 		cfg.elements.forEach(r => count(r.children));
 		const animNames = Object.keys(zipWritten).filter(n => n.startsWith('animations/'));
-		console.log(`Корни: ${roots}`);
-		console.log(`Файлы в архиве: ${Object.keys(zipWritten).filter(n => !n.startsWith('animations/')).join(', ')}`
-			+ ` + анимаций ${animNames.length}`);
-		console.log(`Элементов с геометрией: ${boxes}, UV-сетка ${cfg.skinSize.x}×${cfg.skinSize.y}`);
-		if (!boxes) { failed = true; console.log('❌ в проекте CPM ни одного ящика'); }
+		console.log(`Roots: ${roots}`);
+		console.log(`Files in the archive: ${Object.keys(zipWritten).filter(n => !n.startsWith('animations/')).join(', ')}`
+			+ ` + animations ${animNames.length}`);
+		console.log(`Elements with geometry: ${boxes}, UV grid ${cfg.skinSize.x}×${cfg.skinSize.y}`);
+		if (!boxes) { failed = true; console.log('❌ not a single box in the CPM project'); }
 		if (!animNames.length) {
 			failed = true;
-			console.log('❌ ни одной анимации не перенесено');
+			console.log('❌ not a single animation was transferred');
 		} else {
-			// Имя файла — не украшение: по его префиксу загрузчик решает, поза это
-			// или жест, а по остатку — какая именно поза.
+			// The file name is not decoration: by its prefix the loader decides whether it is a pose
+			// or a gesture, and by the rest — which pose exactly.
 			const bad = animNames.filter(n => !/^animations\/[vcg]_[^/]+\.json$/.test(n));
-			if (bad.length) { failed = true; console.log('❌ имена анимаций не по формату: ' + bad.slice(0, 3).join(', ')); }
+			if (bad.length) { failed = true; console.log('❌ animation names do not follow the format: ' + bad.slice(0, 3).join(', ')); }
 			const one = JSON.parse(zipWritten[animNames[0]]);
 			const comps = one.frames.reduce((s, f) => s + f.components.length, 0);
-			console.log(`Первая анимация: ${animNames[0].replace('animations/', '')}, `
-				+ `${one.frames.length} кадров, ${comps} записей, duration ${one.duration}`);
+			console.log(`First animation: ${animNames[0].replace('animations/', '')}, `
+				+ `${one.frames.length} frames, ${comps} records, duration ${one.duration}`);
 			const ids = new Set();
 			const collect = l => (l || []).forEach(e => { ids.add(e.storeID); collect(e.children); });
 			cfg.elements.forEach(r => collect(r.children));
 			const orphan = one.frames.some(f => f.components.some(c => !ids.has(c.storeID)));
-			if (orphan) { failed = true; console.log('❌ кадр ссылается на storeID, которого нет в модели'); }
+			if (orphan) { failed = true; console.log('❌ a keyframe refers to a storeID the model does not have'); }
 		}
-		if (cfg.version !== 1) { failed = true; console.log('❌ version не 1'); }
-		if (!zipWritten['skin.png']) { failed = true; console.log('❌ в архиве нет skin.png'); }
+		if (cfg.version !== 1) { failed = true; console.log('❌ version is not 1'); }
+		if (!zipWritten['skin.png']) { failed = true; console.log('❌ the archive has no skin.png'); }
 		if (!exported || exported.extensions[0] !== 'cpmproject') {
 			failed = true;
-			console.log('❌ Blockbench.export не позван с расширением cpmproject');
+			console.log('❌ Blockbench.export was not called with the cpmproject extension');
 		}
 	}
 }
 
-console.log(`${String.fromCharCode(10)}${failed ? '❌ ЕСТЬ ПРОБЛЕМЫ' : '✅ ПЛАГИН ИСПОЛНЯЕТСЯ БЕЗ ОШИБОК'}${String.fromCharCode(10)}`);
+console.log(`${String.fromCharCode(10)}${failed ? '❌ THERE ARE PROBLEMS' : '✅ THE PLUGIN RUNS WITHOUT ERRORS'}${String.fromCharCode(10)}`);
 process.exit(failed ? 1 : 0);

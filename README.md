@@ -1,8 +1,9 @@
 # glTF to Minecraft
 
 A Blockbench plugin that converts **glTF models — from an archive, a folder or
-straight from Sketchfab — into cubes Minecraft can use**: a GeckoLib model or a
-Customizable Player Models skin, with bones, textures and animations.
+straight from Sketchfab — into cubes Minecraft can use**: GeckoLib and Bedrock
+models with bones and animations, still Java block and item models, or a
+Customizable Player Models skin.
 
 It used to be called *GeckoLib Model Importer*. The name changed on the catalog
 maintainer's remark: it imports nothing from GeckoLib, and almost nothing in it is
@@ -15,11 +16,14 @@ does that conversion, and everything around it.
 ## What it does
 
 - **Import a ZIP or a folder** with a glTF model and textures, and get a finished
-  GeckoLib project. Textures may be PNG, JPEG, GIF or WebP.
+  project in the format you pick: GeckoLib, Bedrock Entity, Generic Model or a
+  still Java block/item model. Textures may be PNG, JPEG, GIF or WebP.
 - **Browse Sketchfab** inside Blockbench, through the official Data API. Author
   and licence are shown on every card; only models the author allowed to be
-  downloaded are listed, and by default only those made in Blockbench.
-- **Several textures** are packed into one atlas, because GeckoLib wants one.
+  downloaded are listed, and by default only those made in Blockbench. The cards
+  show triangle and animation counts, and a filter keeps only animated models.
+- **Several textures** are packed into one atlas, because GeckoLib and Bedrock
+  want one.
 - **Merged meshes** are split back into separate cubes automatically — many
   exporters emit 708 triangles where the model really has 59 boxes.
 - **Animations** are carried over, both rotation and position channels.
@@ -45,7 +49,10 @@ and on a model already rigged like a player it needs no corrections; on anything
 else a silent guess would be worse than none.
 
 A Blockbench project is created alongside the export — the UV convention is
-measured on it, and it lets the result be looked at. The report states the
+measured on it, and it lets the result be looked at. It is a Generic model, so the
+CPM export needs no other plugin. Bones and parts carry the same tidied names in
+the dialog and in the `.cpmproject` as in the outliner, and the dialog starts at
+the top of the tidied tree rather than at the export wrapper. The report states the
 encoded size against CPM's 30 kB budget for a local model, so an export too
 heavy to keep off the CPM servers says so before it is saved.
 
@@ -65,9 +72,14 @@ of 0.6 × 0.7 × 0.001 px became 0.75 × 0.75 × 0 and disappeared into the head
 
 ## Requirements
 
-The **GeckoLib Animation Utils** plugin: its format is what projects are built
-into. The plugin checks for it before importing. Converting an already-open model
-from meshes to cubes (Filter menu) works without it.
+Bedrock, Generic and Java models, and the CPM export, need nothing beyond
+Blockbench.
+
+The GeckoLib format comes from a plugin of its own: **GeckoLib Models &
+Animations** on Blockbench 5, **GeckoLib Animation Utils** on Blockbench 4 (it
+does not install on 5). The import dialog offers GeckoLib either way; when it is
+chosen and missing, the plugin names whichever of the two installs on your build
+and opens the plugin list on it, while the dialog stays open for another choice.
 
 Downloading from Sketchfab needs a personal API token, available in the Sketchfab
 profile settings under *Password & API*. Searching works without one.
@@ -77,14 +89,50 @@ profile settings under *Password & API*. Searching works without one.
 **Search:** File → Import → *Import from Sketchfab*.
 
 The **Made in Blockbench** box is ticked by default: only models tagged
-`blockbench` are listed. They are built from cubes to begin with and convert
-whole, while most of Sketchfab is sculpts that leave only a pile of bounding
+`blockbench` are listed. They are mostly built from cubes and convert whole,
+while most of Sketchfab is sculpts that leave only a pile of bounding
 boxes. Measured on the live API for "girl": without the filter 0 of 24 results
 carry the tag, with it 24 of 24, on the second page as well. The box can be
 unticked.
 
-**Import:** File → Import → *Import glTF as GeckoLib Model*, or
-the tile on the start screen.
+The **Animated** box, off by default, leaves only models with at least one
+animation: 24 of 24 with it, 3 to 13 of 24 without, depending on the query. Every
+card shows the model's triangle count and number of animations, with the meaning
+in the tooltip; both come with the search results, so they cost no extra request.
+
+The tag is no guarantee: anyone can set it by hand, and Blockbench makes meshes
+too. So a card also says whether the model looks **built from cubes**, from the
+same two counts. Sketchfab counts vertex positions, and a separate cube has 8 of
+them to 12 triangles — exactly 2:3. A cube icon means exactly that ratio; a
+warning icon means shared corners (below 0.6 vertices per triangle), which is how
+smooth and bevelled models look. Measured on 144 tagged models, with every
+preview looked at: all 24 looked at of the 84 at exactly 2:3 were cubes, and
+most of the 21 below 0.6 were cars with round wheels, bevelled houses and smooth
+figures. In between there is no icon, because there it is mixed.
+
+**Import:** File → Import → *Import glTF Model*, or the tile on the start
+screen.
+
+**Format.** The first field of the import dialog is what to build into:
+
+| Format | For | Bones and animations |
+|---|---|---|
+| GeckoLib | Java mods using GeckoLib | yes |
+| Bedrock Entity | Bedrock add-ons | yes |
+| Generic Model | converting further with *File → Convert Project*, or exporting glTF/OBJ | yes |
+| Java Block/Item | resource packs | no, the model is still |
+
+The last choice is remembered. Without GeckoLib installed the dialog starts on
+Bedrock.
+
+A **Java block or item model** has no bones and does not animate, so the model
+arrives still. It also has a box to stay in: every element within −16…32 on each
+axis, the block and one block around it. The model is moved into that box — with
+centring on, it stands on the block the way block models do — and shrunk only if
+it is larger than the box. Which Minecraft can show it depends on its cube
+rotations: one axis in 22.5° steps works everywhere, any angle on one axis needs
+1.21.6, and cubes turned on several axes or past 45° need 1.21.11. The report
+says which one the model needs, and the project's Java format is raised to it.
 
 **A folder works in place of an archive.** In the same picker you can select the
 files of an already unpacked folder — the model, its `.bin` and the textures —
@@ -97,12 +145,23 @@ When a folder holds several `.gltf` files — a Sketchfab export ships a twin wi
 no textures next to the model — the one declaring the most images is chosen.
 It used to be whichever came first, which depended on the order of names.
 
-The dialog offers five settings: model size, centring, extra rotation around X
-and Y, and whether to transfer animations. Everything else lives behind the
+**The outliner is tidied.** Every glTF node used to become a folder, and a
+Sketchfab export nests them deep: three wrapper nodes on top, then every cube in
+a node of its own, inside another node holding its mesh. Folders that hold one
+thing or nothing and carry no animation are dropped — on the local collection
+1691 folders became 217 — which changes no shape, since bones stand unrotated.
+Every animated folder stays. A cube takes its author's name (`cube`, not
+`_gltfNode_2`), and Sketchfab's `_N` numbering is taken off when every name
+carries it. *Keep every glTF node as a folder* under Advanced settings turns this
+off.
+
+Besides the format, the dialog offers five settings: model size, centring,
+extra rotation around X and Y, and whether to transfer animations. Everything else lives behind the
 **Advanced settings** checkbox — those are levers for diagnosing breakage, and
 they are best changed one at a time.
 
-**Install:** Blockbench → File → Plugins → *Load Plugin from File* →
+**Install:** Blockbench → File → Plugins, search for *glTF to Minecraft*. A
+version from this repository installs through *Load Plugin from File* →
 [`plugin/gltf_to_minecraft.js`](plugin/gltf_to_minecraft.js).
 
 ## Testing without Blockbench
@@ -117,6 +176,9 @@ node tools/verify-snap.mjs                           # grid snapping and its cos
 node tools/verify-coplanar.mjs                       # coplanar face separation
 node tools/verify-images.mjs                         # PNG/JPEG/GIF/WebP headers
 node tools/verify-cpm.mjs                            # .cpmproject: structure, limits, geometry
+node tools/verify-java-fit.mjs                       # Java models: the box and the Minecraft version
+node tools/verify-outliner.mjs                       # the outliner: folders dropped, none animated lost
+node tools/verify-per-face-textures.mjs              # a texture per face, and faces with none
 node tools/verify-strips.mjs                         # triangle strips and fans, on real models
 node tools/verify-search-filter.mjs --live           # Sketchfab filters, against the live API
 node tools/smoke-plugin.mjs                          # the whole import path
@@ -127,8 +189,11 @@ node tools/survey-models.mjs                         # what the import makes of 
 `THREE`, `JSZip`…) and runs the entire import on several archives: PNG, JPEG with
 an unreadable image, an image nobody refers to, objects naming no image, a
 texture without the alpha its material asks for, and the same model as loose
-folder files. It also checks that every entry sits in File > Import. The CPM
-export runs after them, down the same path but saving a `.cpmproject`. It catches what
+folder files. Then it builds the same model into Bedrock, Generic and Java, and
+checks the Java one against the box and its format version. It also checks that
+every entry sits in File > Import, and what happens without GeckoLib on
+Blockbench 4 and 5. The CPM export runs after them, down the same path but saving
+a `.cpmproject`. It catches what
 `node --check` misses — reading a `const` before its declaration, typos in names,
 calls to functions that do not exist.
 

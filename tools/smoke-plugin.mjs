@@ -277,6 +277,64 @@ function zipContents() {
         return files;
     }
 
+    // A face with no texture, the way Blockbench exports it: a primitive of its own
+    // on a transparent 1×1 placeholder. Here the first face (two triangles) of every
+    // mesh is moved into such a primitive, put first. The image used to be taken
+    // from the first primitive for the whole object, so the cube went invisible.
+    if (scenario === 'placeholder') {
+        const gltf = JSON.parse(fs.readFileSync(gltfPath, 'utf8'));
+        const blank = (gltf.images || []).length;
+        gltf.images = [...(gltf.images || []), { uri: 'textures/blank.png' }];
+        gltf.textures = [...(gltf.textures || []), { source: blank }];
+        gltf.materials = [...(gltf.materials || []),
+            { pbrMetallicRoughness: { baseColorTexture: { index: gltf.textures.length - 1 } }, alphaMode: 'MASK' }];
+        const mat = gltf.materials.length - 1;
+        // Indices are re-cut into two lists per mesh and appended as a buffer of their own.
+        const read = accIndex => {
+            const acc = gltf.accessors[accIndex], view = gltf.bufferViews[acc.bufferView];
+            const buf = Buffer.from(gltf.buffers[view.buffer].uri.split(',')[1], 'base64');
+            const at = (view.byteOffset || 0) + (acc.byteOffset || 0);
+            const size = { 5121: 1, 5123: 2, 5125: 4 }[acc.componentType];
+            return Array.from({ length: acc.count }, (_, i) =>
+                size === 1 ? buf[at + i] : size === 2 ? buf.readUInt16LE(at + i * 2) : buf.readUInt32LE(at + i * 4));
+        };
+        const lists = [];
+        const addIndices = list => {
+            lists.push(list);
+            gltf.bufferViews.push({ buffer: gltf.buffers.length, byteOffset: 0, byteLength: 0 });
+            gltf.accessors.push({ bufferView: gltf.bufferViews.length - 1, componentType: 5125, count: list.length, type: 'SCALAR' });
+            return gltf.accessors.length - 1;
+        };
+        for (const mesh of gltf.meshes || []) {
+            const prim = mesh.primitives[0];
+            const idx = read(prim.indices);
+            mesh.primitives = [
+                { ...prim, indices: addIndices(idx.slice(0, 6)), material: mat },
+                { ...prim, indices: addIndices(idx.slice(6)) },
+            ];
+        }
+        const chunks = [];
+        let offset = 0;
+        lists.forEach((list, i) => {
+            const b = Buffer.alloc(list.length * 4);
+            list.forEach((v, k) => b.writeUInt32LE(v, k * 4));
+            const view = gltf.bufferViews[gltf.bufferViews.length - lists.length + i];
+            view.byteOffset = offset;
+            view.byteLength = b.length;
+            offset += b.length;
+            chunks.push(b);
+        });
+        const extra = Buffer.concat(chunks);
+        gltf.buffers.push({ byteLength: extra.length, uri: 'data:application/octet-stream;base64,' + extra.toString('base64') });
+
+        files['source/model.gltf'] = new Uint8Array(Buffer.from(JSON.stringify(gltf), 'utf8'));
+        files['textures/gltf_embedded_0.png'] = new Uint8Array(fs.readFileSync(texPath));
+        // Blockbench's placeholder byte for byte: one pixel, (0, 0, 0, 0).
+        files['textures/blank.png'] = new Uint8Array(Buffer.from('89504e470d0a1a0a0000000d494844520000000100000001'
+            + '08060000001f15c4890000000b494441541857636000020000050001aad5c8510000000049454e44ae426082', 'hex'));
+        return files;
+    }
+
     if (scenario === 'png') {
         files['source/model.gltf'] = new Uint8Array(fs.readFileSync(gltfPath));
         files['textures/gltf_embedded_0.png'] = new Uint8Array(fs.readFileSync(texPath));
@@ -313,6 +371,31 @@ function fakeDialogRoot(html) {
 
 const sandboxActions = [];
 const menuPlacement = {};
+let lastDialog = null;
+// Every form dialog shown, by id: the CPM dialog's questions are checked below.
+const formsShown = {};
+// Fields the import dialog is confirmed with instead of its defaults.
+let formOverride = {};
+const projectsMade = [];
+// Blockbench 5's Java format: its rotation limits follow the project's version,
+// and on 1.21.11 and above there are none.
+const javaFormat = { id: 'java_block' };
+for (const [key, from] of [['rotation_limit', '1.21.11'], ['rotation_snap', '1.21.6']]) {
+	Object.defineProperty(javaFormat, key, {
+		get: () => {
+			const v = String(sandbox.Project.java_block_version || '1.9.0').split('.').map(Number);
+			const w = from.split('.').map(Number);
+			for (let i = 0; i < 3; i++) if ((v[i] || 0) !== (w[i] || 0)) return (v[i] || 0) < (w[i] || 0);
+			return false;
+		},
+	});
+}
+const ALL_FORMATS = {
+	geckolib_model: { id: 'geckolib_model' },
+	bedrock: { id: 'bedrock' },
+	free: { id: 'free' },
+	java_block: javaFormat,
+};
 let zipWritten = null;
 let exported = null;
 
@@ -325,8 +408,17 @@ const sandbox = {
 	Mesh: { all: [] },
 	Canvas: { updateAll() { }, updateUV() { }, updateAllBones() { }, updateView() { } },
 	Project: { box_uv: true, texture_width: 16, texture_height: 16 },
-	Formats: { geckolib_model: { id: 'geckolib_model' } },
-	newProject: () => true,
+	Formats: ALL_FORMATS,
+	// Records which format each import built into. A Java project starts on the
+	// 1.21.6 format, as it does when the user's settings target that Minecraft:
+	// too old for cubes turned on several axes, so the import has to raise it.
+	newProject(format) {
+		projectsMade.push(format.id);
+		sandbox.Format = format;
+		if (format.id === 'java_block') sandbox.Project.java_block_version = '1.21.6';
+		else delete sandbox.Project.java_block_version;
+		return true;
+	},
 	Undo: { initEdit() { }, finishEdit() { } },
 	Timeline: { setTime() { } },
 	Animator: { preview() { } },
@@ -348,6 +440,7 @@ const sandbox = {
 			if (this.lines && this.lines.length) {
 				reportShown = this.lines.join(String.fromCharCode(10));
 				this.object = fakeDialogRoot(reportShown);
+				lastDialog = this;
 				return;
 			}
 			// confirm at once with the default values
@@ -357,6 +450,8 @@ const sandbox = {
 				else if (v.type === 'select') form[k] = v.default;
 				else if (v.type === 'number') form[k] = v.value;
 			}
+			if (this.form) Object.assign(form, formOverride);
+			if (this.form) formsShown[this.id] = this.form;
 			this.onConfirm(form);
 		}
 		hide() { }
@@ -523,6 +618,14 @@ async function runImport(label) {
 const baseline = created.cubes.length;
 failed = await runImport('archive with PNG') || failed;
 const cubesPNG = created.cubes.length;
+// What every face of the plain import reads, and the texture size: the placeholder
+// scenario below has to land on exactly the same.
+const faceUV = () => created.cubes.map(c => JSON.stringify({
+    solid: (c.to || []).every((v, k) => Math.abs(v - c.from[k]) >= 0.01),
+    faces: Object.entries(c.faces).map(([k, f]) => [k, f.uv, !!f.texture]),
+}));
+const facesPNG = faceUV();
+const texturePNG = [sandbox.Project.texture_width, sandbox.Project.texture_height].join('×');
 void baseline;
 
 scenario = 'jpeg';
@@ -684,6 +787,84 @@ if (!reportShown || reportShown.indexOf('without an alpha channel') < 0) {
     console.log('The report names the lost alpha: OK');
 }
 
+// --- faces with no texture, on a placeholder, put first in every mesh.
+scenario = 'placeholder';
+failed = await runImport('every mesh starts with an untextured face') || failed;
+{
+    const bad = [];
+    // Every face that still has a texture reads a piece the plain import read too,
+    // and each cube loses at most the one face moved onto the placeholder. Compared
+    // as sets of rectangles per cube, not by face name: with a face missing, the
+    // box solver may pick another of the equal orientations, which renames faces
+    // and mirrors rectangles while laying the same picture on the same geometry.
+    //
+    // Only solid cubes are held to that. A 0.001 px panel has four sides of no
+    // area whose UV are lines, and with one of its two big faces gone the solver
+    // lays those lines differently; they cover nothing either way. For panels it
+    // is enough that nothing reads outside the texture.
+    const rects = faces => faces.filter(([, uv, textured]) => textured && uv)
+        .map(([, uv]) => [Math.min(uv[0], uv[2]), Math.min(uv[1], uv[3]), Math.max(uv[0], uv[2]), Math.max(uv[1], uv[3])]
+            .map(v => +v.toFixed(3)).join(',')).sort();
+    const nowAll = faceUV().map(f => JSON.parse(f));
+    const wasAll = facesPNG.map(f => JSON.parse(f));
+    const [tw, th] = [sandbox.Project.texture_width, sandbox.Project.texture_height];
+    let foreign = 0, extraHidden = 0, outside = 0;
+    if (nowAll.length !== wasAll.length) bad.push(`${nowAll.length} cubes instead of ${wasAll.length}`);
+    else nowAll.forEach((cube, i) => {
+        const list = rects(cube.faces);
+        outside += list.filter(r => r.split(',').map(Number).some((v, k) => v < -1e-6 || v > (k % 2 ? th : tw) + 1e-6)).length;
+        if (!cube.solid || !wasAll[i].solid) return;
+        const left = rects(wasAll[i].faces);
+        for (const r of list) {
+            const at = left.indexOf(r);
+            if (at < 0) foreign++; else left.splice(at, 1);
+        }
+        if (left.length > 1) extraHidden++;
+    });
+    if (outside) bad.push(`${outside} faces read outside the texture`);
+    if (foreign) bad.push(`${foreign} faces of solid cubes read a piece of texture the plain import never used`);
+    if (extraHidden) bad.push(`${extraHidden} solid cubes lost more than the one untextured face`);
+    const size = [sandbox.Project.texture_width, sandbox.Project.texture_height].join('×');
+    if (size !== texturePNG) bad.push(`the texture changed from ${texturePNG} to ${size}: the placeholder decided the atlas`);
+    if (!/Faces with no texture: \d+ kept hidden/.test(reportShown || '')) bad.push('the report does not mention the hidden faces');
+    if (bad.length) { failed = true; console.log('❌ ' + bad.join('; ')); }
+    else console.log(`Solid cubes read the same texture as without the placeholder, nothing reads outside it, texture ${size}: OK`);
+}
+
+// --- the other formats. The conversion is the same; what differs is the project
+// it lands in, and for Java the box, the format version and the animations.
+scenario = 'png';
+for (const target of ['bedrock', 'free', 'java_block']) {
+    formOverride = { target };
+    failed = await runImport('built into ' + target) || failed;
+    const made = projectsMade[projectsMade.length - 1];
+    const bad = [];
+    if (made !== target) bad.push(`the project was built as ${made}`);
+    if (!reportShown || reportShown.indexOf('Built into: ') < 0) bad.push('the report does not name the format');
+    if (target === 'bedrock' && !sandbox.Project.model_identifier) bad.push('no geometry identifier, so Bedrock would export geometry.unknown');
+    if (target !== 'java_block' && !created.animations.length) bad.push('the animations were lost');
+    if (target === 'java_block') {
+        if (created.animations.length) bad.push(`${created.animations.length} animations in a Java model`);
+        if (!/Animations left out: \d+/.test(reportShown || '')) bad.push('the report does not say the animations were left out');
+        // The box Blockbench's Java format enforces, inflate included.
+        const outside = created.cubes.filter(c => [0, 1, 2].some(a =>
+            Math.min(c.from[a], c.to[a]) - (c.inflate || 0) < -16 - 1e-9
+            || Math.max(c.from[a], c.to[a]) + (c.inflate || 0) > 32 + 1e-9));
+        if (outside.length) bad.push(`${outside.length} cubes outside the −16…32 box`);
+        // Cubes turned on several axes or past 45° need the 1.21.11 format.
+        const free = created.cubes.filter(c => {
+            const turned = (c.rotation || []).filter(v => Math.abs(v) > 1e-6);
+            return turned.length > 1 || turned.some(v => Math.abs(v) > 45);
+        }).length;
+        const version = sandbox.Project.java_block_version;
+        if (free && version !== '1.21.11') bad.push(`${free} freely turned cubes, but the format stayed at ${version}`);
+        console.log(`Java: ${free} freely turned cubes, format ${version}`);
+    }
+    if (bad.length) { failed = true; console.log(`❌ ${target}: ${bad.join('; ')}`); }
+    else console.log(`Built into ${target}: OK`);
+}
+formOverride = {};
+
 // --- export to CPM: the same path, but saving a .cpmproject at the end.
 // Catches the same as the rest of the smoke test: access to fields that do not exist,
 // typos in names, forgotten Blockbench stubs. Geometric correctness
@@ -701,6 +882,15 @@ if (!cpmAction) {
 	try {
 		cpmAction.click();
 		await new Promise(r => setTimeout(r, 500));
+		// The bones asked about start at the top of the tidied tree. They used to
+		// start at the file's own top — the export wrapper, or a pass-through node
+		// such as this model's node_141 — which nobody can map to a body part.
+		const cpmForm = formsShown[Object.keys(formsShown).find(k => k.endsWith('_cpm_dialog'))] || {};
+		const asked = Object.entries(cpmForm).filter(([k]) => k.startsWith('b_')).map(([, v]) => v.label);
+		const noise = asked.filter(l => /^(node_\d+|sketchfab_model|root|gltf_scenerootnode|_?gltfnode_\d+)$/i.test(l));
+		if (!asked.length) { failed = true; console.log('❌ the CPM dialog asked about no bones'); }
+		else if (noise.length) { failed = true; console.log('❌ the CPM dialog asks about pass-through nodes: ' + noise.join(', ')); }
+		else console.log(`CPM dialog asks about ${asked.length} bones, none of them pass-through: OK`);
 	} catch (e) {
 		failed = true;
 		console.log('ERROR during the CPM export: ' + e.message);
@@ -752,6 +942,75 @@ if (!cpmAction) {
 			console.log('❌ Blockbench.export was not called with the cpmproject extension');
 		}
 	}
+}
+
+// Without the GeckoLib format, choosing GeckoLib stops the import and names the
+// plugin to install. GeckoLib Animation Utils stops at Blockbench 5.0 and GeckoLib
+// Models & Animations starts there; the message used to name only the old one,
+// which Blockbench 5 refuses to install. The catalog entry that installs on this
+// build is the one named.
+console.log('');
+console.log('--- GeckoLib missing');
+{
+	const savedFormats = sandbox.Formats;
+	const savedOlder = sandbox.Blockbench.isOlderThan;
+	const { geckolib_model, ...others } = ALL_FORMATS;
+	void geckolib_model;
+	sandbox.Formats = others;
+
+	// Nothing chosen before: the dialog offers Bedrock, which ships with Blockbench.
+	sandbox.localStorage._v = {};
+	lastDialog = null;
+	importAction.click();
+	await new Promise(r => setTimeout(r, 300));
+	const made = projectsMade[projectsMade.length - 1];
+	// The import report is a dialog too; only the GeckoLib message counts here.
+	const asked = !!lastDialog && String(lastDialog.id).endsWith('_need_geckolib');
+	if (made !== 'bedrock' || asked) {
+		failed = true;
+		console.log(`❌ without GeckoLib the default built ${made}${asked ? ' and still asked for GeckoLib' : ''}`);
+	} else {
+		console.log('No GeckoLib, nothing chosen before: builds into Bedrock: OK');
+	}
+
+	formOverride = { target: 'geckolib_model' };
+	const entry = (id, verdict, extra) => Object.assign(
+		{ id, title: id, installed: false, disabled: false, isInstallable: () => verdict }, extra);
+	const cases = [
+		{ label: 'Blockbench 5', older: false, want: 'GeckoLib Models & Animations', pick: 'geckolib',
+			all: [entry('geckolib', true), entry('animation_utils', 'outdated_plugin')] },
+		{ label: 'Blockbench 4', older: true, want: 'GeckoLib Animation Utils', pick: 'animation_utils',
+			all: [entry('geckolib', 'outdated_client'), entry('animation_utils', true)] },
+		{ label: 'no catalog, Blockbench 5', older: false, want: 'GeckoLib Models & Animations', pick: null,
+			all: [] },
+		{ label: 'installed but disabled', older: false, want: 'disabled', pick: 'geckolib',
+			all: [entry('geckolib', true, { installed: true, disabled: true }), entry('animation_utils', 'outdated_plugin')] },
+	];
+	for (const c of cases) {
+		let selected = null;
+		sandbox.Blockbench.isOlderThan = () => c.older;
+		sandbox.Plugins = {
+			all: c.all,
+			dialog: { show() { }, content_vue: { selectPlugin(p) { selected = p.id; }, setTab() { } } },
+		};
+		lastDialog = null;
+		reportShown = '';
+		importAction.click();
+		const text = reportShown;
+		const wrongName = c.label !== 'Blockbench 4' && text.includes('Animation Utils');
+		if (lastDialog) lastDialog.onConfirm();
+		const bad = [];
+		if (!lastDialog) bad.push('no dialog');
+		if (!text.includes(c.want)) bad.push(`does not say "${c.want}"`);
+		if (wrongName) bad.push('names the plugin Blockbench 5 will not install');
+		if (selected !== c.pick) bad.push(`opened the list on ${selected || 'nothing'} instead of ${c.pick || 'nothing'}`);
+		if (bad.length) { failed = true; console.log(`❌ ${c.label}: ${bad.join('; ')}`); }
+		else console.log(`${c.label}: names ${c.want}${c.pick ? ', opens its page' : ''}: OK`);
+	}
+	sandbox.Formats = savedFormats;
+	sandbox.Blockbench.isOlderThan = savedOlder;
+	delete sandbox.Plugins;
+	formOverride = {};
 }
 
 console.log(`${String.fromCharCode(10)}${failed ? '❌ THERE ARE PROBLEMS' : '✅ THE PLUGIN RUNS WITHOUT ERRORS'}${String.fromCharCode(10)}`);

@@ -1,0 +1,84 @@
+{
+	"0.1.0": {
+		"title": "0.1.0",
+		"author": "MopicMP",
+		"categories": [
+			{
+				"title": "First release",
+				"list": [
+					"Imports a glTF model from a ZIP into a GeckoLib project: bones, cubes, textures and animations.",
+					"Browses Sketchfab inside Blockbench through the official Data API."
+				]
+			}
+		]
+	},
+	"0.1.1": {
+		"title": "0.1.1",
+		"author": "MopicMP",
+		"categories": [
+			{
+				"title": "New",
+				"list": [
+					"Export to Customizable Player Models: the same import, saved as a .cpmproject, with the player height, the bone mapping and the pose of each animation asked at the end."
+				]
+			}
+		]
+	},
+	"0.1.2": {
+		"title": "0.1.2",
+		"author": "MopicMP",
+		"categories": [
+			{
+				"title": "Changes",
+				"list": [
+					"Renamed from GeckoLib Model Importer to glTF to Minecraft.",
+					"All entries moved to File > Import.",
+					"The Sketchfab search lists models made in Blockbench by default."
+				]
+			},
+			{
+				"title": "New",
+				"list": [
+					"Import from an unpacked folder as well as from a ZIP.",
+					"The report says when a texture has lost the alpha its material asks for."
+				]
+			},
+			{
+				"title": "Fixes",
+				"list": [
+					"A folder with several .gltf files uses the one with the textures, not whichever comes first.",
+					"Textures no mesh refers to stay out of the atlas.",
+					"Objects that name no texture get the main texture instead of the whole atlas."
+				]
+			}
+		]
+	},
+	"0.2.0": {
+		"title": "0.2.0",
+		"author": "MopicMP",
+		"categories": [
+			{
+				"title": "New",
+				"list": [
+					"Choose what to build into: GeckoLib, Bedrock Entity, Generic Model or a still Java block/item model. The choice is remembered.",
+					"Java models are fitted into the box the format allows, and the report says which Minecraft version their cube rotations need.",
+					"GeckoLib is no longer required: Bedrock, Generic and Java come with Blockbench, and the Customizable Player Models export needs no plugin at all.",
+					"Sketchfab search: an Animated filter, and each card shows the model's triangle and animation counts.",
+					"Sketchfab cards say whether a model looks built from cubes: the blockbench tag alone does not tell.",
+					"The outliner is tidied: folders that hold one thing and carry no animation are dropped, cubes take their author's names, and Sketchfab's numbering is taken off. Advanced settings can keep every node.",
+					"The Customizable Player Models dialog and file use the same names, and the dialog no longer asks about the export wrapper."
+				]
+			},
+			{
+				"title": "Fixes",
+				"list": [
+					"A cube whose faces use different textures took the first face's texture for all six, and when that first face had none, the whole cube came out invisible. Each face now gets its own texture, and faces exported without one stay hidden, as they were in Blockbench.",
+					"The transparent stand-in Blockbench exports for untextured faces no longer takes room in the texture, and no longer turns into invisible extra cubes.",
+					"On Blockbench 5 the GeckoLib message named GeckoLib Animation Utils, which does not install there. It now names the GeckoLib plugin that installs on your build and opens the plugin list on it.",
+					"Clicking a Sketchfab card again while it downloaded started another download, and each opened its own import dialog. Downloads now go one at a time.",
+					"The format list in the import dialog was cut off; the explanation now sits under it."
+				]
+			}
+		]
+	}
+}

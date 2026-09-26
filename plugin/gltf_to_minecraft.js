@@ -1,8 +1,8 @@
 /**
  * glTF to Minecraft
  * Turns glTF models — from an archive, a folder or straight from Sketchfab —
- * into cubes that Minecraft can use: a GeckoLib project or a Customizable
- * Player Models skin.
+ * into cubes that Minecraft can use: a GeckoLib, Bedrock or Generic project, a
+ * still Java block/item model, or a Customizable Player Models skin.
  *
  * The core (solveBox) does not depend on Blockbench and is covered by
  * tools/verify-conversion.mjs, which runs it against a real OBJ file.
@@ -17,7 +17,7 @@
 const PLUGIN_ID = 'gltf_to_minecraft';
 
 // All tolerances are relative. Absolute ones do not work here: models contain
-// panels 0.001 px thick next to 8 px cubes (see the pitfalls in docs/format-notes.md).
+// panels 0.001 px thick next to 8 px cubes (see Box detection in docs/how-it-works.md).
 const TOL_ORTHO = 1e-3;   // cosine between axes (flat case only)
 const TOL_REL = 1e-4;     // fraction of the object bounds
 const TOL_UV = 1e-3;      // texture pixels
@@ -1227,6 +1227,9 @@ function parseGLTFFiles(files, opts) {
 		if (img.role) return;                       // one picked from the archive is already tagged
 		img.role = anyColor ? (imageRole.get(i) || 'aux') : 'color';
 	});
+	// A fully transparent placeholder: Blockbench's stand-in for "no texture".
+	for (const img of images) img.blank = !!img.bytes && isBlankImage(img.bytes);
+	let blankTriangles = 0, blankObjects = 0;
 
 	const objects = [];
 	// The node hierarchy is needed twice: as GeckoLib bones and as animation
@@ -1288,6 +1291,8 @@ function parseGLTFFiles(files, opts) {
 			index: nodeIndex,
 			name: node.name || `node_${nodeIndex}`,
 			parent: parentIndex,
+			// the export wrapper carries no transform of its own any more
+			wrapper: !!wrap,
 			// the bone pivot is the node origin in world space
 			pivot: matApply(world, [0, 0, 0]).map((v, i) => v * scale + offset[i]),
 			// A wrapper has no rest pose: animations never target it, and its
@@ -1311,8 +1316,14 @@ function parseGLTFFiles(files, opts) {
 		if (node.mesh !== undefined) {
 			const mesh = gltf.meshes[node.mesh];
 			const faces = [];
-			// which image this object uses: material -> texture -> image
-			let imageIndex = -1;
+			// Which image each primitive uses: material -> texture -> image. Per
+			// primitive, not per object: Blockbench exports every face of a cube as
+			// a primitive of its own, and a face with no texture points at a
+			// transparent placeholder. The image used to be taken from the first
+			// primitive and applied to all six, so a cube whose first face had no
+			// texture came out invisible — reported on a shark whose fin vanished.
+			const trianglesPerImage = new Map();
+			let blankHere = 0;
 			for (const prim of mesh.primitives || []) {
 				if (prim.mode !== undefined && !TRIANGULATE[prim.mode]) {
 					warnings.push(`${node.name || mesh.name}: primitive mode ${prim.mode} skipped (points and lines are not geometry)`);
@@ -1320,12 +1331,16 @@ function parseGLTFFiles(files, opts) {
 				}
 				const posIdx = prim.attributes && prim.attributes.POSITION;
 				if (posIdx === undefined) continue;
-				if (imageIndex < 0 && prim.material !== undefined) {
+				let imageIndex = -1;
+				if (prim.material !== undefined) {
 					const mat = (gltf.materials || [])[prim.material];
 					const texRef = mat && mat.pbrMetallicRoughness && mat.pbrMetallicRoughness.baseColorTexture;
 					const tex = texRef && (gltf.textures || [])[texRef.index];
 					if (tex && tex.source !== undefined) imageIndex = tex.source;
 				}
+				// A placeholder face keeps its geometry — the cube needs its corners —
+				// but gets no UV, so it stays hidden as it was in Blockbench.
+				const blank = imageIndex >= 0 && !!images[imageIndex] && images[imageIndex].blank;
 				const pos = readAccessor(gltf, buffers, posIdx).map(p => {
 					const w = matApply(world, p);
 					return [w[0] * scale + offset[0], w[1] * scale + offset[1], w[2] * scale + offset[2]];
@@ -1347,7 +1362,7 @@ function parseGLTFFiles(files, opts) {
 				const rect = o.uvRects
 					? (imageIndex >= 0 ? o.uvRects[imageIndex] : (o.uvFallback || null))
 					: null;
-				const uv = uvIdx === undefined ? null
+				const uv = uvIdx === undefined || blank ? null
 					: readAccessor(gltf, buffers, uvIdx).map(t => rect
 						? [t[0] * rect.w + rect.x, t[1] * rect.h + rect.y]
 						: [t[0] * uvW, t[1] * uvH]);
@@ -1361,9 +1376,27 @@ function parseGLTFFiles(files, opts) {
 						positions: tri.map(k => pos[k]),
 						uvs: tri.map(k => uv ? uv[k] : null),
 					});
+					if (blank) blankHere++;
+					else trianglesPerImage.set(imageIndex, (trianglesPerImage.get(imageIndex) || 0) + 1);
 				}
 			}
-			if (faces.length) objects.push({ name: node.name || mesh.name || `object_${objects.length}`, faces, node: nodeIndex, image: imageIndex });
+			blankTriangles += blankHere;
+			// Nothing but placeholder faces: an object nobody could ever see. Sketchfab's
+			// conversion splits a cube by material, so its untextured faces arrive as
+			// objects of their own — flat panels, or L-shaped pairs taken for non-boxes.
+			if (faces.length && blankHere === faces.length) { blankObjects++; }
+			else if (faces.length) {
+				// The object's main image, for texel density and the report: the one
+				// most of its triangles use.
+				let imageIndex = -1, most = -1;
+				for (const [img, n] of trianglesPerImage) if (img >= 0 && n > most) { imageIndex = img; most = n; }
+				objects.push({
+					name: node.name || mesh.name || `object_${objects.length}`, faces, node: nodeIndex,
+					image: imageIndex,
+					// every image the object reaches, for the atlas
+					images: [...trianglesPerImage.keys()].filter(i => i >= 0),
+				});
+			}
 		}
 
 		for (const child of node.children || []) visit(child, world, nodeIndex, worldQuat);
@@ -1385,6 +1418,8 @@ function parseGLTFFiles(files, opts) {
 
 	return {
 		objects, images, warnings, hierarchy, wantsAlpha,
+		// faces on a transparent placeholder, kept hidden, and objects made of nothing else
+		blank: { triangles: blankTriangles, objects: blankObjects },
 		animations: parseAnimations(gltf, buffers, warnings),
 	};
 }
@@ -1683,13 +1718,14 @@ const SKETCHFAB_API = 'https://api.sketchfab.com/v3';
  * showing them would only raise false expectations.
  *
  * `blockbenchOnly` narrows the results to models tagged "blockbench". Those
- * were built from cubes to begin with and convert without loss, while a
- * sculpt or a scanned statue can only arrive as a pile of bounding boxes.
+ * are mostly built from cubes and convert whole, while a sculpt or a scanned
+ * statue can only arrive as a pile of bounding boxes. Mostly, not always: the
+ * tag can be set by hand, and Blockbench makes meshes too — cubeHint tells.
  * Checked on the live API: for "girl", none of 24 plain results carry the tag
  * and all 24 filtered ones do — on the second page as well, because the `next`
  * link Sketchfab returns keeps the parameter.
  */
-function sketchfabSearchURL(query, blockbenchOnly) {
+function sketchfabSearchURL(query, blockbenchOnly, animatedOnly) {
 	const params = [
 		'type=models',
 		'downloadable=true',
@@ -1698,6 +1734,9 @@ function sketchfabSearchURL(query, blockbenchOnly) {
 		'q=' + encodeURIComponent(query || ''),
 	];
 	if (blockbenchOnly) params.push('tags=blockbench');
+	// Measured on the live API: with it 24 of 24 results carry an animation, without
+	// it 3 to 13 of 24 did, and the next-page link keeps the parameter.
+	if (animatedOnly) params.push('animated=true');
 	return SKETCHFAB_API + '/search?' + params.join('&');
 }
 
@@ -2581,6 +2620,210 @@ function buildCPMFiles(input) {
 	};
 }
 
+// ------------------------------------------------------ Java block/item models
+
+/**
+ * The box a Java block or item model may occupy: every element's from/to within
+ * −16…32 on each axis, the block itself and one block around it.
+ */
+const JAVA_BOX = [-16, 32];
+
+/**
+ * Where a still model goes in a Java model, and at what size.
+ *
+ * The bounds are taken from the cubes, not from the vertices: a turned cube's
+ * from/to are its unturned box, which reaches further than its corners do. And
+ * inflate counts, because the export bakes it into from/to.
+ *
+ * With `place` the model stands like a block — X and Z centred on it, the
+ * bottom on its floor; without it the model stays where it is. Either way it is
+ * then pushed back inside the box, and shrunk only if it is larger than the box
+ * itself: moving by whole pixels keeps a model on its grid, shrinking does not.
+ *
+ * Returns the transform p' = pivot + k·(p − pivot) + shift.
+ */
+function fitJavaBox(boxes, place) {
+	if (!boxes.length) return { k: 1, pivot: [0, 0, 0], shift: [0, 0, 0], extent: 0 };
+	const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+	for (const b of boxes) {
+		for (let a = 0; a < 3; a++) {
+			const half = Math.abs(b.size[a]) / 2 + (b.inflate || 0);
+			lo[a] = Math.min(lo[a], b.center[a] - half);
+			hi[a] = Math.max(hi[a], b.center[a] + half);
+		}
+	}
+	const span = JAVA_BOX[1] - JAVA_BOX[0];
+	const extent = Math.max(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]);
+	// A hair under the box when shrinking: coordinates are rounded to 0.001
+	// afterwards, and a value on the very edge could round past it.
+	const k = extent > span ? (span - 0.002) / extent : 1;
+	const pivot = lo.map((v, a) => (v + hi[a]) / 2);
+	const shift = [0, 0, 0];
+	for (let a = 0; a < 3; a++) {
+		const half = k * (hi[a] - lo[a]) / 2;
+		let centre = !place ? pivot[a] : a === 1 ? half : 8;
+		if (k === 1) centre = pivot[a] + Math.round(centre - pivot[a]);
+		centre = Math.min(Math.max(centre, JAVA_BOX[0] + half), JAVA_BOX[1] - half);
+		shift[a] = centre - pivot[a];
+	}
+	return { k, pivot, shift, extent };
+}
+
+function applyFit(p, fit) {
+	return p.map((v, a) => fit.pivot[a] + fit.k * (v - fit.pivot[a]) + fit.shift[a]);
+}
+
+/**
+ * The oldest Java model format that holds these cube rotations, and with it the
+ * oldest Minecraft that shows the model as built. These are Blockbench's own
+ * rules for the three rotation formats it writes:
+ *   1.9.0   — one axis, a multiple of 22.5° within ±45°;
+ *   1.21.6  — one axis, any angle within ±45°;
+ *   1.21.11 — any rotation, on all three axes.
+ * `counts` says how many cubes need each of them.
+ */
+const JAVA_ROTATION_FORMATS = ['1.9.0', '1.21.6', '1.21.11'];
+function javaFormatFor(rotations) {
+	const counts = [0, 0, 0];
+	let need = 0;
+	for (const r of rotations) {
+		const turned = r.filter(v => Math.abs(v) > 1e-6);
+		let level = 0;
+		if (turned.length > 1 || turned.some(v => Math.abs(v) > 45 + 1e-6)) level = 2;
+		else if (turned.length && Math.abs(turned[0] / 22.5 - Math.round(turned[0] / 22.5)) > 1e-4) level = 1;
+		counts[level]++;
+		need = Math.max(need, level);
+	}
+	return { version: JAVA_ROTATION_FORMATS[need], counts };
+}
+
+/** Dotted version comparison: '1.21.6' is below '1.21.11', and '26.3' above both. */
+function versionBelow(a, b) {
+	const pa = String(a).split('.').map(Number), pb = String(b).split('.').map(Number);
+	for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+		const x = pa[i] || 0, y = pb[i] || 0;
+		if (x !== y) return x < y;
+	}
+	return false;
+}
+
+// ------------------------------------------------------------ the outliner
+
+/**
+ * Names an exporter makes up rather than an author: Sketchfab's mesh holders
+ * (`_gltfNode_2`), Blender's `Object_104`, the parser's own `node_7`, bare numbers.
+ */
+const GENERIC_NODE = /^(_?gltfnode_?\d*|object_?\d*|node_?\d*|mesh_?\d*|_?\d+)$/i;
+
+/**
+ * Which glTF nodes become folders, where each cube goes, and what things are called.
+ *
+ * Every glTF node used to become a folder, and a Sketchfab export nests them
+ * deep: three wrapper nodes on top, then every cube inside a node of its own,
+ * inside another node holding the mesh. On the local collection that was up to
+ * 1691 folders for 704 cubes, and a cube 12 folders down on average.
+ *
+ * A folder goes when it has no animation and holds one thing or nothing: its
+ * content moves up to its parent. The export wrapper goes whatever it holds.
+ * That changes no shape: bones stand unrotated, so a folder nothing animates
+ * moves nothing. Animated folders all stay, and with them the skeleton.
+ *
+ * A cube whose node went takes the innermost author's name on the way up — the
+ * node Sketchfab named `cube_1`, not the `_gltfNode_2` holding its mesh.
+ *
+ * Sketchfab appends `_N` to every node name. When every name carries such a
+ * number it is the exporter's, and one is stripped; a folder name that then
+ * repeats gets a number back, because GeckoLib and Bedrock bones must differ.
+ *
+ * `cubeNodes` lists the node of every cube; returns the kept folders with their
+ * parents and names, and for a cube, its folder and name.
+ */
+function tidyHierarchy(hierarchy, cubeNodes, animated) {
+	const byIndex = new Map(hierarchy.map(h => [h.index, h]));
+	const count = new Map(hierarchy.map(h => [h.index, 0]));
+	for (const h of hierarchy) if (byIndex.has(h.parent)) count.set(h.parent, count.get(h.parent) + 1);
+	for (const n of cubeNodes) if (count.has(n)) count.set(n, count.get(n) + 1);
+
+	const removed = new Set();
+	const liveParent = n => {
+		let p = byIndex.get(n).parent;
+		while (removed.has(p)) p = byIndex.get(p).parent;
+		return byIndex.has(p) ? p : -1;
+	};
+	// Handing a single child up leaves the parent's count as it was; an empty
+	// folder lowers it and a lifted wrapper raises it, hence the loop.
+	for (let changed = true; changed;) {
+		changed = false;
+		for (const h of hierarchy) {
+			const n = h.index;
+			if (removed.has(n) || animated.has(n)) continue;
+			const c = count.get(n);
+			if (c > 1 && !h.wrapper) continue;
+			const p = liveParent(n);
+			removed.add(n);
+			changed = true;
+			if (p >= 0) count.set(p, count.get(p) - 1 + c);
+		}
+	}
+
+	const authored = hierarchy.filter(h => !h.wrapper);
+	const strip = authored.length > 0 && authored.every(h => /_\d+$/.test(h.name));
+	const clean = name => (strip && name.replace(/_\d+$/, '')) || name;
+
+	const parent = new Map();
+	const name = new Map();
+	const used = new Set();
+	for (const h of hierarchy) {
+		if (removed.has(h.index)) continue;
+		parent.set(h.index, liveParent(h.index));
+		const base = clean(h.name);
+		let unique = base;
+		for (let k = 2; used.has(unique); k++) unique = `${base}_${k}`;
+		used.add(unique);
+		name.set(h.index, unique);
+	}
+
+	return {
+		kept: [...parent.keys()],
+		parent,
+		name,
+		removed: removed.size,
+		stripped: strip,
+		/** The folder a cube of node `n` goes in, or -1 for the top level. */
+		home: n => (!byIndex.has(n) ? -1 : removed.has(n) ? liveParent(n) : n),
+		/** Any node's name as the user sees it: the folder's, or the cleaned one. */
+		label: n => name.get(n) || (byIndex.has(n) ? clean(byIndex.get(n).name) : ''),
+		/** A cube's name: the innermost author's name on its removed chain, or its own. */
+		cubeName(n, own) {
+			for (let c = n; byIndex.has(c) && removed.has(c); c = byIndex.get(c).parent) {
+				const h = byIndex.get(c);
+				if (!h.wrapper && !GENERIC_NODE.test(h.name)) return clean(h.name);
+			}
+			return clean(own);
+		},
+	};
+}
+
+/**
+ * Whether a Sketchfab model looks built from cubes, from the two counts every
+ * search result carries. Sketchfab counts vertex positions, so a separate cube
+ * gives 8 of them to 12 triangles — exactly 2:3 — while shared corners, as on
+ * any smooth or bevelled mesh, bring vertices below that.
+ *
+ * Measured on 144 models tagged `blockbench`, with every preview looked at:
+ * all 24 looked at of the 84 at exactly 2:3 were cubes; below 0.6 (21 models)
+ * most were cars with round wheels, bevelled houses and smooth figures. In
+ * between it is mixed, so nothing is claimed there.
+ *
+ * Returns 'cubes', 'shapes' or null.
+ */
+function cubeHint(faceCount, vertexCount) {
+	const f = Number(faceCount), v = Number(vertexCount);
+	if (!(f > 0) || !(v > 0)) return null;
+	if (3 * v === 2 * f) return 'cubes';
+	return v / f < 0.6 ? 'shapes' : null;
+}
+
 // ------------------------------------------------------------ Node export
 
 if (typeof Plugin === 'undefined') {
@@ -2590,6 +2833,8 @@ if (typeof Plugin === 'undefined') {
 			FACE_DIRS, FACE_NAMES,
 			parseGLTFFiles, parseGLB, parseAnimations, readAccessor, matMul, matFromTRS, matApply, matIdentity,
 			qMul, qConj, qRotate, boneDeltaRotation, boneDeltaPosition, sampleChannel, pickScale, snapScale, texelScale, correctionQuat, packAtlas, splitComponents, boxFromBounds, TRIANGULATE, isDegenerate, imageSize, sniffMime, axisRotationOf, quatFromMat, triangleNormal, snapGrid, snapVec, snapAngle, isIdentityBasis, placeCoords, snapSafely, tidyVec, hasGltfArchive, sketchfabSearchURL, hasAlphaChannel, resolveCoplanar, cubeFaces, faceRectsOverlap,
+			JAVA_BOX, fitJavaBox, applyFit, javaFormatFor, versionBelow, tidyHierarchy, GENERIC_NODE, cubeHint,
+			isBlankImage, inflateRaw,
 			buildCPMFiles, buildCPMConfig, buildCPMAnimations, cpmAlignOffset, cpmEstimateSize, cpmAutoAssign, cpmAutoPose, cpmPoint, cpmDelta, cpmEuler, cpmEulerFromQuat, cpmAngle, cpmUVScale, cpmFaceUV, CPM_PARTS, CPM_PART_NAMES, CPM_FACE,
 		};
 	}
@@ -3018,6 +3263,161 @@ function hasAlphaChannel(bytes) {
 	if ((bytes[0] === 0xFF && bytes[1] === 0xD8)) return false;
 
 	return null;
+}
+
+/**
+ * Whether an image is fully transparent — a placeholder, not a texture.
+ *
+ * Blockbench exports a face that has no texture with a material of its own,
+ * pointing at a 1×1 picture whose one pixel is (0,0,0,0). Such faces were not
+ * there in Blockbench, so they must stay hidden, and the picture has no place
+ * in the atlas: it doubled one to 128×64 for a single transparent pixel.
+ *
+ * Only small PNGs are read, and the answer is yes only when certain: every
+ * decoded sample is zero (then every pixel is zero whatever the row filters,
+ * since each is predicted from zeros) and zero means transparent — an alpha
+ * channel, or a palette whose entry 0 has zero alpha. Anything else, any doubt,
+ * is no.
+ */
+function isBlankImage(bytes) {
+	if (!bytes || bytes.length < 33 || bytes.length > 8192) return false;
+	const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	if (dv.getUint32(0) !== 0x89504E47) return false;
+	const width = dv.getUint32(16), height = dv.getUint32(20);
+	const depth = bytes[24], type = bytes[25];
+	if (!width || !height || width * height > 4096) return false;
+	const idat = [];
+	let paletteTransparent = false;
+	for (let at = 8; at + 8 <= bytes.length;) {
+		const len = dv.getUint32(at);
+		const name = String.fromCharCode(bytes[at + 4], bytes[at + 5], bytes[at + 6], bytes[at + 7]);
+		if (at + 12 + len > bytes.length) return false;
+		if (name === 'IDAT') idat.push(bytes.subarray(at + 8, at + 8 + len));
+		if (name === 'tRNS' && type === 3) paletteTransparent = len > 0 && bytes[at + 8] === 0;
+		if (name === 'IEND') break;
+		at += 12 + len;
+	}
+	if (!(type === 6 || type === 4 || (type === 3 && paletteTransparent))) return false;
+	const joined = new Uint8Array(idat.reduce((n, c) => n + c.length, 0));
+	let o = 0;
+	for (const c of idat) { joined.set(c, o); o += c.length; }
+	// Bytes per row: the filter byte plus the samples.
+	const channels = type === 6 ? 4 : type === 4 ? 2 : 1;
+	const expected = height * (1 + Math.ceil(width * channels * depth / 8));
+	let raw;
+	try { raw = inflateRaw(joined.subarray(2), expected); } catch (e) { return false; }
+	if (raw.length !== expected) return false;
+	// Each row starts with its filter type, which may be anything; only the
+	// samples after it have to be zero.
+	const row = expected / height;
+	for (let i = 0; i < raw.length; i++) if (i % row && raw[i]) return false;
+	return true;
+}
+
+/**
+ * Inflates a raw deflate stream (RFC 1951): stored, fixed and dynamic blocks.
+ * Blockbench offers no zlib to a plugin in every build, and a PNG's pixels sit
+ * behind one. Written after Mark Adler's puff; `limit` stops a runaway stream.
+ */
+function inflateRaw(data, limit) {
+	const LBASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+	const LEXT = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+	const DBASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+	const DEXT = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+	const ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+	const out = [];
+	let pos = 0, bit = 0;
+	const bits = n => {
+		let v = 0;
+		for (let i = 0; i < n; i++) {
+			if (pos >= data.length) throw new Error('stream ended early');
+			v |= ((data[pos] >> bit) & 1) << i;
+			if (++bit === 8) { bit = 0; pos++; }
+		}
+		return v;
+	};
+	// A canonical Huffman code: how many codes of each length, and the symbols in order.
+	const code = lengths => {
+		const count = new Array(16).fill(0), offs = new Array(16).fill(0);
+		for (const l of lengths) count[l]++;
+		count[0] = 0;
+		for (let l = 1; l < 16; l++) offs[l] = offs[l - 1] + count[l - 1];
+		const symbol = new Array(lengths.length);
+		lengths.forEach((l, s) => { if (l) symbol[offs[l]++] = s; });
+		return { count, symbol };
+	};
+	const decode = h => {
+		let c = 0, first = 0, index = 0;
+		for (let len = 1; len < 16; len++) {
+			c |= bits(1);
+			const n = h.count[len];
+			if (c - n < first) return h.symbol[index + (c - first)];
+			index += n;
+			first = (first + n) << 1;
+			c <<= 1;
+		}
+		throw new Error('bad Huffman code');
+	};
+	let last;
+	do {
+		last = bits(1);
+		const type = bits(2);
+		if (type === 0) {
+			if (bit) { bit = 0; pos++; }
+			if (pos + 4 > data.length) throw new Error('stream ended early');
+			const len = data[pos] | (data[pos + 1] << 8);
+			pos += 4;
+			if (pos + len > data.length) throw new Error('stream ended early');
+			for (let i = 0; i < len; i++) out.push(data[pos++]);
+		} else if (type === 1 || type === 2) {
+			let lit, dist;
+			if (type === 1) {
+				const l = [];
+				for (let s = 0; s < 288; s++) l.push(s < 144 ? 8 : s < 256 ? 9 : s < 280 ? 7 : 8);
+				lit = code(l);
+				dist = code(new Array(30).fill(5));
+			} else {
+				const nlen = bits(5) + 257, ndist = bits(5) + 1, ncode = bits(4) + 4;
+				const cl = new Array(19).fill(0);
+				for (let i = 0; i < ncode; i++) cl[ORDER[i]] = bits(3);
+				const clc = code(cl);
+				const lengths = [];
+				while (lengths.length < nlen + ndist) {
+					const sym = decode(clc);
+					if (sym < 16) { lengths.push(sym); continue; }
+					let rep, val = 0;
+					if (sym === 16) {
+						if (!lengths.length) throw new Error('repeat with nothing before');
+						val = lengths[lengths.length - 1];
+						rep = 3 + bits(2);
+					} else rep = sym === 17 ? 3 + bits(3) : 11 + bits(7);
+					for (let i = 0; i < rep; i++) lengths.push(val);
+				}
+				lit = code(lengths.slice(0, nlen));
+				dist = code(lengths.slice(nlen, nlen + ndist));
+			}
+			for (;;) {
+				let sym = decode(lit);
+				if (sym < 256) { out.push(sym); }
+				else if (sym === 256) break;
+				else {
+					sym -= 257;
+					if (sym >= 29) throw new Error('bad length symbol');
+					const len = LBASE[sym] + bits(LEXT[sym]);
+					const d = decode(dist);
+					if (d >= 30) throw new Error('bad distance symbol');
+					const back = DBASE[d] + bits(DEXT[d]);
+					if (back > out.length) throw new Error('distance too far back');
+					for (let i = 0; i < len; i++) out.push(out[out.length - back]);
+				}
+				if (out.length > limit) throw new Error('longer than expected');
+			}
+		} else {
+			throw new Error('bad block type');
+		}
+		if (out.length > limit) throw new Error('longer than expected');
+	} while (!last);
+	return Uint8Array.from(out);
 }
 
 function imageSize(bytes) {
@@ -3726,6 +4126,16 @@ let lastImport = null;
 function buildFromFiles(files, sourceName, opts) {
 	const report = [];
 
+	// The format goes first: finding out there is nothing to build into after the
+	// whole parse would waste it.
+	const target = targetById((opts && opts.target) || 'geckolib_model');
+	const format = typeof Formats !== 'undefined' && Formats[target.id];
+	if (!format) {
+		if (target.id === 'geckolib_model') requireGeckolib();
+		else Blockbench.showMessageBox({ title: 'Import failed', message: `This Blockbench has no ${target.name} format.` });
+		return;
+	}
+
 	// A probe parse in glTF units: both the texture size and the model bounds are
 	// needed to pick the coordinate scale.
 	let probe;
@@ -3751,8 +4161,10 @@ function buildFromFiles(files, sourceName, opts) {
 	// textures every single primitive carries material 0, so the rest are
 	// declared and never used: one packed twelve images into a 512x256 atlas
 	// while the only one its geometry reads is 32x32.
+	// Every image an object's faces use, not only its main one: a cube may wear
+	// two pictures on different faces.
 	const reached = new Set();
-	for (const o of probe.objects) if (o.image >= 0) reached.add(o.image);
+	for (const o of probe.objects) for (const i of o.images || [o.image]) if (i >= 0) reached.add(i);
 
 	// Only colour goes into the atlas: normal and roughness maps are useless in
 	// Minecraft yet take up just as much room.
@@ -3760,7 +4172,8 @@ function buildFromFiles(files, sourceName, opts) {
 	// The reach test is skipped when nothing reports an image at all — a file
 	// without materials gives no assignment to go on, and there the pictures in
 	// the archive are the whole of what we know.
-	const usable = (img, i) => !!img.size && img.role !== 'aux'
+	// A transparent placeholder stays out too: its faces are hidden anyway.
+	const usable = (img, i) => !!img.size && img.role !== 'aux' && !img.blank
 		&& (!reached.size || reached.has(i));
 	const images = sized.filter(usable);
 	const remap = [];
@@ -3778,8 +4191,13 @@ function buildFromFiles(files, sourceName, opts) {
 	const aux = sized.filter(img => img.size && img.role === 'aux').length;
 	const unread = sized.filter(img => !img.size).length;
 	const unreached = sized.filter((img, i) =>
-		img.size && img.role !== 'aux' && reached.size && !reached.has(i)).length;
+		img.size && img.role !== 'aux' && !img.blank && reached.size && !reached.has(i)).length;
 	if (aux) report.push(`Auxiliary maps skipped: ${aux} (normals, specular) — unused in Minecraft`);
+	// Blockbench exports an untextured face with a transparent 1×1 stand-in.
+	if (probe.blank && probe.blank.triangles) {
+		report.push(`Faces with no texture: ${probe.blank.triangles / 2 | 0} kept hidden, as they were in `
+			+ 'Blockbench' + (probe.blank.objects ? `; ${probe.blank.objects} objects made only of them left out` : ''));
+	}
 	if (unread) report.push(`Images skipped: ${unread} — format not recognised`);
 	// Said plainly, because it is the honest explanation for a model that arrives
 	// wearing one texture everywhere: the file itself points all of its geometry
@@ -3937,6 +4355,10 @@ function buildFromFiles(files, sourceName, opts) {
 		parts.forEach((faces, i) => split.push({
 			...obj,
 			name: parts.length > 1 ? `${obj.name}_${i + 1}` : obj.name,
+			// kept apart, so tidying the names strips the exporter's number and
+			// not the part number appended here
+			baseName: obj.name,
+			part: parts.length > 1 ? i + 1 : 0,
 			faces,
 		}));
 	}
@@ -3983,20 +4405,30 @@ function buildFromFiles(files, sourceName, opts) {
 		return;
 	}
 
-	newProject(Formats.geckolib_model);
+	newProject(format);
 	Project.name = (sourceName || 'model').replace(/\.[^.]*$/, '');
-	// IMPORTANT: geckolib_model defaults to box_uv = true, while we need per-face
-	// UV, otherwise Blockbench re-unwraps them and the layout is lost.
+	// IMPORTANT: geckolib_model and bedrock default to box_uv = true, while we need
+	// per-face UV, otherwise Blockbench re-unwraps them and the layout is lost.
 	Project.box_uv = false;
 	Project.texture_width = size.width;
 	Project.texture_height = size.height;
+	// Bedrock names the geometry after this identifier, and an empty one is
+	// exported as geometry.unknown.
+	if (target.id === 'bedrock' && !Project.model_identifier) {
+		Project.model_identifier = Project.name.toLowerCase().replace(/[^a-z0-9_.]+/g, '_') || 'model';
+	}
 
-	// One texture per project, as GeckoLib requires.
+	// One texture per project, as GeckoLib and Bedrock require.
 	// Redrawing is not only for the atlas: Blockbench stores textures as PNG, and
 	// a Sketchfab JPEG must first go through a canvas, or it lands in the project
 	// labelled png and fails to open.
 	const needRedraw = needAtlas || (images[0].mime && images[0].mime !== 'image/png');
 	const atlasTexture = new Texture({ name: needAtlas ? 'atlas.png' : (images[0].name || 'texture.png').replace(/\.[^.]*$/, '.png') });
+	// Generic models measure UV against each texture's own size rather than the
+	// project's. The constructor copies the project's size, set just above; it is
+	// written out anyway, so the UV never depend on when the atlas finishes drawing.
+	atlasTexture.uv_width = size.width;
+	atlasTexture.uv_height = size.height;
 	if (needRedraw) {
 		atlasTexture.add();
 		// the content is filled in once the images decode
@@ -4038,14 +4470,6 @@ function buildFromFiles(files, sourceName, opts) {
 			: '  Approximated objects lost their shape, but their texture is laid out per face.');
 	}
 
-	// bones: the hierarchy is walked in order, a parent always before its child
-	const groupByNode = {};
-	for (const h of parsed.hierarchy) {
-		const g = new Group({ name: h.name, origin: snapVec(h.pivot) }).init();
-		if (h.parent >= 0 && groupByNode[h.parent]) g.addTo(groupByNode[h.parent]);
-		groupByNode[h.index] = g;
-	}
-
 	// Cubes that landed in one plane are separated in depth via inflate:
 	// otherwise the GPU cannot decide which face is nearer and the model
 	// flickers. Coordinates stay clean throughout.
@@ -4064,24 +4488,105 @@ function buildFromFiles(files, sourceName, opts) {
 			+ '(via Inflate, coordinates untouched)');
 	}
 
+	// A Java model has a box to stay in. Fitted after the coplanar pass, because
+	// inflate counts towards the box, and before anything is created, so cubes and
+	// bones are moved by one and the same transform.
+	let pivots = parsed.hierarchy.map(h => h.pivot);
+	if (target.still) {
+		const fit = fitJavaBox(solved.map((s, i) => ({
+			center: s.sol.center, size: s.sol.size, inflate: coplanar.inflate[i],
+		})), !!(opts && opts.recenter));
+		for (let si = 0; si < solved.length; si++) {
+			const sol = solved[si].sol;
+			solved[si] = { obj: solved[si].obj, sol: { ...sol, center: applyFit(sol.center, fit), size: sol.size.map(v => v * fit.k) } };
+			coplanar.inflate[si] *= fit.k;
+		}
+		pivots = pivots.map(p => applyFit(p, fit));
+		if (fit.shift.some(v => Math.abs(v) > 1e-6)) {
+			report.push(`Placed in the Java model box: moved by [${fit.shift.map(v => +v.toFixed(2)).join(', ')}] px`);
+		}
+		if (fit.k < 1) {
+			report.push(`Shrunk ×${fit.k.toFixed(3)} to fit: the model spans ${fit.extent.toFixed(1)} px, `
+				+ `and a Java model may span ${JAVA_BOX[1] - JAVA_BOX[0]} (from ${JAVA_BOX[0]} to ${JAVA_BOX[1]})`);
+		}
+	}
+
+	// Folders. The pass-through ones go (see tidyHierarchy) unless the user asked
+	// for the file's hierarchy as it is. A node counts as animated only when its
+	// animation is actually carried over: a still Java model, or animations
+	// switched off, leave nothing that needs its folder.
+	const animatedNodes = new Set();
+	if (!target.still && !(opts && opts.animations === false)) {
+		for (const a of parsed.animations) for (const ch of a.channels) animatedNodes.add(ch.node);
+	}
+	const tidy = opts && opts.keep_hierarchy
+		? null
+		: tidyHierarchy(parsed.hierarchy, solved.map(s => s.obj.node), animatedNodes);
+	if (tidy && tidy.removed) {
+		report.push(`Folders: ${tidy.kept.length} of ${parsed.hierarchy.length} kept — the rest held one thing `
+			+ 'or nothing and no animation' + (tidy.stripped ? "; the exporter's _N numbering stripped" : ''));
+	}
+
+	// bones: the hierarchy is walked in order, a parent always before its child
+	const groupByNode = {};
+	parsed.hierarchy.forEach((h, i) => {
+		if (tidy && !tidy.name.has(h.index)) return;
+		const g = new Group({ name: tidy ? tidy.name.get(h.index) : h.name, origin: snapVec(pivots[i]) }).init();
+		const p = tidy ? tidy.parent.get(h.index) : h.parent;
+		if (p >= 0 && groupByNode[p]) g.addTo(groupByNode[p]);
+		groupByNode[h.index] = g;
+	});
+	const groupCount = Object.keys(groupByNode).length;
+
 	let hidden = 0, mirrored = 0, untextured = 0;
+	const cubes = [];
 	for (let si = 0; si < solved.length; si++) {
 		const { obj, sol } = solved[si];
 		if (obj.image < 0) untextured++;
-		const cube = cubeFromSolution(obj.name, sol, atlasTexture.uuid, coplanar.inflate[si]);
-		const parent = groupByNode[obj.node];
+		const name = tidy
+			? tidy.cubeName(obj.node, obj.baseName || obj.name) + (obj.part ? `_${obj.part}` : '')
+			: obj.name;
+		const cube = cubeFromSolution(name, sol, atlasTexture.uuid, coplanar.inflate[si]);
+		const parent = groupByNode[tidy ? tidy.home(obj.node) : obj.node];
 		if (parent) cube.addTo(parent);
 		cube.init();
+		cubes.push(cube);
 		hidden += sol.emptyFaces.length;
 		mirrored += sol.mirrored ? 1 : 0;
 	}
 
+	// Which Minecraft can show the cubes as turned. Blockbench keys its Java
+	// rotation rules to the project's format version, and a new project takes the
+	// version from the user's settings — which may be too old for the model.
+	if (target.still) {
+		const need = javaFormatFor(cubes.map(c => c.rotation || [0, 0, 0]));
+		const had = Project.java_block_version;
+		if (had !== undefined && versionBelow(had, need.version)) {
+			Project.java_block_version = need.version;
+			report.push(`Java model format raised from ${had} to ${need.version}: the cubes need it`);
+		}
+		report.push(need.version === '1.9.0'
+			? 'Minecraft Java version: any'
+			: `Needs Minecraft Java ${need.version} or newer: `
+				+ (need.counts[2] ? `${need.counts[2]} cubes turned on several axes or past 45°` : '')
+				+ (need.counts[2] && need.counts[1] ? ', ' : '')
+				+ (need.counts[1] ? `${need.counts[1]} cubes turned off the 22.5° steps` : ''));
+		// Read after the version is raised: in Blockbench 5 these follow it, while
+		// older builds keep one axis and 22.5° steps whatever the version says.
+		const snapped = (Format.rotation_limit ? need.counts[2] : 0) + (Format.rotation_snap ? need.counts[1] : 0);
+		if (snapped) {
+			report.push(`WARNING: this Blockbench cannot write the rotation of ${snapped} cubes into a `
+				+ 'Java model, so they will be snapped on export. Blockbench 5 keeps them as they are.');
+		}
+	}
+
 	const lines = [
 		`Imported from: ${sourceName}`,
+		`Built into: ${target.name}`,
 		// facts gathered before the project existed (scale, textures)
 		...report,
 		`Cubes created: ${solved.length}`,
-		`Bones created: ${parsed.hierarchy.length}`,
+		`Bones created: ${groupCount}`,
 		`Texture: ${size.width}×${size.height}`,
 		`Objects without a material: ${untextured}`,
 		`Faces hidden: ${hidden}`,
@@ -4089,12 +4594,18 @@ function buildFromFiles(files, sourceName, opts) {
 	];
 	// A failure in animations must not bring down the whole import: cubes and
 	// texture are already built, and losing them over animations makes no sense.
-	try {
-		applyAnimations(parsed, groupByNode, lines, opts);
-	} catch (e) {
-		console.error('[gltf-to-minecraft] animation transfer failed', e);
-		lines.push('', `ANIMATIONS WERE NOT TRANSFERRED: ${(e && e.message) || e}`,
-			'The model and texture were still built correctly.');
+	if (target.still) {
+		if (parsed.animations.length) {
+			lines.push(`Animations left out: ${parsed.animations.length} — Java block and item models do not animate`);
+		}
+	} else {
+		try {
+			applyAnimations(parsed, groupByNode, lines, opts);
+		} catch (e) {
+			console.error('[gltf-to-minecraft] animation transfer failed', e);
+			lines.push('', `ANIMATIONS WERE NOT TRANSFERRED: ${(e && e.message) || e}`,
+				'The model and texture were still built correctly.');
+		}
 	}
 	if (parsed.warnings.length) lines.push('', 'Warnings:', ...parsed.warnings.slice(0, 8));
 	lines.push('', calibration);
@@ -4108,14 +4619,17 @@ function buildFromFiles(files, sourceName, opts) {
 		parsed, solved, images, layout, size, chosenScale, sourceName,
 		texture: atlasTexture,
 		needAtlas,
+		// the CPM dialog and file name bones and cubes the way the outliner does
+		tidy,
 	};
 	showImportReport({
 		title: 'Import finished',
 		summary: [
+			['Format', target.name],
 			['Cubes', String(solved.length)],
-			['Bones', String(parsed.hierarchy.length)],
+			['Bones', String(groupCount)],
 			['Texture', `${size.width}×${size.height}`],
-			['Animations', String(parsed.animations.length)],
+			['Animations', target.still ? 'none, the model is still' : String(parsed.animations.length)],
 			['Scale', `×${chosenScale}`],
 		].concat(approximated
 			? [['Approximated', `${approximated} of ${solved.length} (${approxShare}%)`]]
@@ -4222,8 +4736,8 @@ function sketchfabToken(value) {
 }
 
 /** Model search. No token needed — the endpoint is public. */
-function sketchfabSearch(query, blockbenchOnly) {
-	return sketchfabFetchPage(sketchfabSearchURL(query, blockbenchOnly));
+function sketchfabSearch(query, blockbenchOnly, animatedOnly) {
+	return sketchfabFetchPage(sketchfabSearchURL(query, blockbenchOnly, animatedOnly));
 }
 
 /** Loads a page of results. The `next` field already holds a ready URL. */
@@ -4288,12 +4802,18 @@ function addSketchfabStyles() {
 		.mtc_sf_card { border: 1px solid var(--color-border); border-radius: 4px;
 			padding: 4px; cursor: pointer; font-size: 11px; }
 		.mtc_sf_card:hover { background-color: var(--color-selected); }
+		.mtc_sf_card.mtc_sf_busy { opacity: 0.5; cursor: progress; }
 		.mtc_sf_card img { width: 100%; aspect-ratio: 16/9; object-fit: cover; border-radius: 2px;
 			background: var(--color-back); }
 		.mtc_sf_more { display: flex; align-items: center; justify-content: center;
 			min-height: 90px; font-weight: bold; }
 		.mtc_sf_name { font-weight: bold; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 		.mtc_sf_meta { opacity: 0.7; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+		.mtc_sf_stats { display: flex; gap: 10px; }
+		.mtc_sf_stats span { display: inline-flex; align-items: center; gap: 2px; }
+		.mtc_sf_stats i { font-size: 14px; }
+		.mtc_sf_stats .mtc_sf_none { opacity: 0.45; }
+		.mtc_sf_stats .mtc_sf_warn { color: var(--color-warning, #e8a33d); }
 	`);
 }
 
@@ -4323,9 +4843,11 @@ function openSketchfabBrowser() {
 			+ '<input type="text" class="dark_bordered mtc_sf_query" placeholder="search for, e.g.: dwarf house">'
 			// On by default: a model made in Blockbench is cubes already and comes
 			// through whole, while most of Sketchfab is sculpts that cannot.
-			+ '<label class="mtc_sf_only" title="Only models tagged “blockbench”: they are built '
-			+ 'from cubes and convert without loss">'
+			+ '<label class="mtc_sf_only" title="Only models tagged “blockbench”: mostly built from '
+			+ 'cubes. The icon on each card tells which ones look it">'
 			+ '<input type="checkbox" class="mtc_sf_bb" checked> Made in Blockbench</label>'
+			+ '<label class="mtc_sf_only" title="Only models with at least one animation">'
+			+ '<input type="checkbox" class="mtc_sf_anim"> Animated</label>'
 			+ '<button class="mtc_sf_find">Search</button>'
 			+ '<button class="mtc_sf_token">Token…</button>'
 			+ '</div>'
@@ -4359,13 +4881,32 @@ function openSketchfabBrowser() {
 		}).show();
 	};
 
-	const importModel = model => {
-		// Check the format BEFORE downloading: fetching tens of megabytes only to
-		// then say there is nothing to build into is a bad deal.
-		if (!requireGeckolib()) return;
+	// One download at a time. A second click on a card still downloading started
+	// a second download, and every finished one opened an import dialog of its
+	// own, so the format could not be changed without another dialog popping up
+	// on top. A different card clicked meanwhile would do the same, and worse:
+	// its dialog would appear after the browser had already closed.
+	let busy = null;
+	const importModel = (model, card) => {
+		if (busy) {
+			say(busy.uid === model.uid
+				? `still downloading ${model.name}…`
+				: `wait for ${busy.name} to finish downloading`);
+			return;
+		}
+		busy = model;
+		if (card) card.classList.add('mtc_sf_busy');
+		const release = () => {
+			busy = null;
+			if (card) card.classList.remove('mtc_sf_busy');
+		};
+		// No format check before the download any more: the format is chosen in the
+		// dialog that follows, and three of the four come with Blockbench. If the
+		// one chosen is missing, that dialog stays open with the download in hand.
 		say('preparing ' + model.name + '…');
 		sketchfabDownload(model.uid, say)
 			.then(entries => {
+				release();
 				say('unpacked, asking for settings…');
 				dialog.hide();
 				askImportOptions(opts => {
@@ -4377,7 +4918,7 @@ function openSketchfabBrowser() {
 					return built;
 				});
 			})
-			.catch(e => say('failed: ' + ((e && e.message) || e)));
+			.catch(e => { release(); say('failed: ' + ((e && e.message) || e)); });
 	};
 
 	let nextUrl = null;
@@ -4416,17 +4957,40 @@ function openSketchfabBrowser() {
 			card.title = (m.name || '') + NL + 'Author: ' + ((m.user && m.user.displayName) || '?')
 				+ NL + 'Licence: ' + ((m.license && m.license.label) || '?');
 			const kb = m.archives && m.archives.gltf ? Math.round(m.archives.gltf.size / 1024) : null;
+			// Triangles and animations as icons with a number, the meaning in the
+			// tooltip: both come with the search results, and both say more about
+			// whether a model will come through than its picture does.
+			const tris = Number(m.faceCount) || 0;
+			const anims = Number(m.animationCount) || 0;
+			// The "blockbench" tag is set by hand as often as by Blockbench's own
+			// upload, and Blockbench makes meshes too, so the counts are the better
+			// sign of what will convert — see cubeHint.
+			const hint = cubeHint(m.faceCount, m.vertexCount);
+			const count = n => n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : String(n);
 			card.innerHTML =
 				(thumb ? '<img src="' + thumb.url + '">' : '<img>')
 				+ '<div class="mtc_sf_name"></div>'
 				+ '<div class="mtc_sf_meta mtc_sf_author"></div>'
-				+ '<div class="mtc_sf_meta mtc_sf_lic"></div>';
+				+ '<div class="mtc_sf_meta mtc_sf_lic"></div>'
+				+ '<div class="mtc_sf_meta mtc_sf_stats">'
+				+ `<span title="Triangles: ${tris}"><i class="material-icons">change_history</i>${count(tris)}</span>`
+				+ `<span title="Animations: ${anims}"${anims ? '' : ' class="mtc_sf_none"'}>`
+				+ `<i class="material-icons">animation</i>${anims}</span>`
+				+ (hint === 'cubes'
+					? '<span title="Built from separate cubes: it should convert whole">'
+						+ '<i class="material-icons">view_in_ar</i></span>'
+					: hint === 'shapes'
+						? '<span class="mtc_sf_warn" title="Corners are shared, so this is probably not built '
+							+ 'from cubes: slopes and curves will turn into boxes">'
+							+ '<i class="material-icons">warning</i></span>'
+						: '')
+				+ '</div>';
 			// text goes through textContent: model names sometimes contain markup
 			card.querySelector('.mtc_sf_name').textContent = m.name || '(unnamed)';
 			card.querySelector('.mtc_sf_author').textContent = (m.user && m.user.displayName) || '';
 			card.querySelector('.mtc_sf_lic').textContent =
 				((m.license && m.license.label) || '') + (kb ? ' · ' + (kb > 1024 ? (kb / 1024).toFixed(1) + ' MB' : kb + ' KB') : '');
-			card.addEventListener('click', () => importModel(m));
+			card.addEventListener('click', () => importModel(m, card));
 			results.appendChild(card);
 		}
 		// the more button stays the last tile so the grid is not broken
@@ -4449,11 +5013,12 @@ function openSketchfabBrowser() {
 	};
 
 	const onlyBB = root.querySelector('.mtc_sf_bb');
+	const onlyAnimated = root.querySelector('.mtc_sf_anim');
 	let searched = false;
 	const doSearch = () => {
 		searched = true;
 		say('searching…');
-		sketchfabSearch(q ? q.value : '', !onlyBB || onlyBB.checked)
+		sketchfabSearch(q ? q.value : '', !onlyBB || onlyBB.checked, !!onlyAnimated && onlyAnimated.checked)
 			.then(render).catch(e => say('search error: ' + ((e && e.message) || e)));
 	};
 
@@ -4461,6 +5026,7 @@ function openSketchfabBrowser() {
 	// Flipping the filter over results already on screen redoes the search:
 	// otherwise the grid would keep showing what the box no longer says.
 	if (onlyBB) onlyBB.addEventListener('change', () => { if (searched) doSearch(); });
+	if (onlyAnimated) onlyAnimated.addEventListener('change', () => { if (searched) doSearch(); });
 	if (root.querySelector('.mtc_sf_token')) root.querySelector('.mtc_sf_token').addEventListener('click', askToken);
 	if (q) {
 		// Blockbench treats Enter in a dialog as confirmation and closes the window,
@@ -4476,22 +5042,96 @@ function openSketchfabBrowser() {
 }
 
 /**
+ * The formats a model can be built into.
+ *
+ * The conversion owes nothing to GeckoLib: cubes turned freely, per-face UV,
+ * bones and keyframes are what Bedrock entities and Generic models take as well,
+ * and the UV convention is measured on whichever project is open. Java block and
+ * item models take the cubes too, but have no bones and do not animate, so they
+ * get a still model fitted into their box.
+ *
+ * Modded Entity and OptiFine are left out: both demand box UV or whole-pixel
+ * sizes, and neither can turn a cube on its own.
+ */
+const TARGETS = [
+	{ id: 'geckolib_model', name: 'GeckoLib',
+		about: 'An animated model for Java mods that use GeckoLib.' },
+	{ id: 'bedrock', name: 'Bedrock Entity',
+		about: 'An animated entity model for Bedrock add-ons. Comes with Blockbench.' },
+	{ id: 'free', name: 'Generic Model',
+		about: 'Keeps bones and animations, and goes further from here: File → Convert Project, '
+			+ 'or an export to glTF or OBJ. Comes with Blockbench.' },
+	{ id: 'java_block', name: 'Java Block/Item', still: true,
+		about: 'Java block and item models have no bones and do not animate: the model arrives '
+			+ 'still. It has to fit the box such a model may take up, from −16 to 32 on each '
+			+ 'axis, so it is moved into it, and shrunk only if it is larger. With centring on, '
+			+ 'it stands on the block the way block models do.' },
+];
+const TARGET_KEY = PLUGIN_ID + '_target';
+
+function targetById(id) {
+	return TARGETS.find(t => t.id === id) || TARGETS[0];
+}
+
+/**
+ * The last format chosen, as long as it can still be built; otherwise GeckoLib
+ * where it is installed, and Bedrock, which ships with Blockbench, where it is not.
+ */
+function defaultTarget() {
+	let saved = null;
+	try { saved = localStorage.getItem(TARGET_KEY); } catch (e) { /* storage may be off */ }
+	if (saved && TARGETS.some(t => t.id === saved) && (saved !== 'geckolib_model' || geckolibAvailable())) return saved;
+	return geckolibAvailable() ? 'geckolib_model' : 'bedrock';
+}
+
+/**
  * Asks for the import settings.
  *
  * Kept separate: the same dialog serves both the file import and downloads from
- * the Sketchfab browser.
+ * the Sketchfab browser. `fixedTarget` builds into that format without asking —
+ * the CPM export needs a project only to measure on, and any format will do.
  */
-function askImportOptions(onReady) {
+function askImportOptions(onReady, fixedTarget) {
 	// Visibility rule: advanced fields appear once the checkbox is ticked.
 	const adv = form => !!form.advanced;
+	// Java models do not animate, so the animation levers hide for them.
+	const animated = form => (fixedTarget || form.target) !== 'java_block';
+	const advAnim = form => adv(form) && animated(form);
+
+	// GeckoLib is offered even when it is not installed, so the choice leads
+	// somewhere: to the plugin that provides it.
+	//
+	// The list holds bare names and the explanation sits under it, one line for
+	// whichever format is chosen: "GeckoLib: animated, for Java mods" did not fit
+	// the width of a select and was cut off mid-word.
+	const hasGeckolib = geckolibAvailable();
+	const targetOptions = {};
+	for (const t of TARGETS) {
+		targetOptions[t.id] = t.id === 'geckolib_model' && !hasGeckolib ? 'GeckoLib (no plugin)' : t.name;
+	}
+	const targetFields = fixedTarget ? {} : {
+		target: { label: 'Build into', type: 'select', default: defaultTarget(), options: targetOptions },
+	};
+	if (!fixedTarget) {
+		for (const t of TARGETS) {
+			targetFields['about_' + t.id] = {
+				type: 'info', condition: form => form.target === t.id,
+				text: t.id === 'geckolib_model' && !hasGeckolib
+					? 'The GeckoLib plugin is not installed. Choose this anyway and the import '
+						+ 'will show which plugin to get and where.'
+					: t.about,
+			};
+		}
+	}
 
 	new Dialog({
 		id: PLUGIN_ID + '_import_dialog',
 		title: 'Import glTF model',
-		// Expanded by a checkbox: an ordinary user needs four settings, the other
-		// eight are levers for diagnosing breakage. Eleven fields in a row read like
-		// a cockpit and get in the way of anyone who just wants to open a model.
+		// Expanded by a checkbox: an ordinary user needs a few settings, the other
+		// eight are levers for diagnosing breakage. Every field in a row reads like
+		// a cockpit and gets in the way of anyone who just wants to open a model.
 		form: {
+			...targetFields,
 			scale_mode: {
 				label: 'Model size', type: 'select', default: 'auto',
 				options: { auto: 'Detect automatically', 16: '×16 (unit = block)', 1: '×1 (unit = pixel)' },
@@ -4505,7 +5145,7 @@ function askImportOptions(onReady) {
 				label: 'Extra rotation around Y', type: 'select', default: '0',
 				options: { 0: 'none', 90: '90°', 180: '180° (faces backwards)', 270: '270°' },
 			},
-			animations: { label: 'Transfer animations', type: 'checkbox', value: true },
+			animations: { label: 'Transfer animations', type: 'checkbox', value: true, condition: animated },
 
 			advanced: { label: 'Advanced settings', type: 'checkbox', value: false },
 
@@ -4528,7 +5168,7 @@ function askImportOptions(onReady) {
 				},
 			},
 			positions: {
-				label: 'Position channels in animations', type: 'select', default: 'big', condition: adv,
+				label: 'Position channels in animations', type: 'select', default: 'big', condition: advAnim,
 				options: {
 					big: 'Larger than the threshold',
 					rt: 'All, with rotation pre-compensation',
@@ -4540,55 +5180,103 @@ function askImportOptions(onReady) {
 			},
 			pos_threshold: {
 				label: 'Position threshold, px', type: 'number',
-				value: 0, min: 0, max: 30, step: 0.1, condition: adv,
+				value: 0, min: 0, max: 30, step: 0.1, condition: advAnim,
 			},
 			align_times: {
-				label: 'Align keyframe times', type: 'checkbox', value: false, condition: adv,
+				label: 'Align keyframe times', type: 'checkbox', value: false, condition: advAnim,
 			},
 			zfight: {
 				label: 'Separate coplanar faces (anti-flicker)', type: 'checkbox',
 				value: true, condition: adv,
 			},
+			keep_hierarchy: {
+				label: 'Keep every glTF node as a folder', type: 'checkbox',
+				value: false, condition: adv,
+			},
 			anim_order: {
-				label: 'Rotation formula', type: 'select', default: 'post', condition: adv,
+				label: 'Rotation formula', type: 'select', default: 'post', condition: advAnim,
 				options: { post: 'R(t)·R0⁻¹ (default)', pre: 'R0⁻¹·R(t) (if animations drift apart)' },
 			},
 			hint: {
-				type: 'info', condition: adv,
+				type: 'info', condition: advAnim,
 				text: 'The maths gives exactly two exact options: All — if Blockbench adds the offset '
 					+ 'outside the rotation, and pre-compensated — if inside. '
 					+ 'If bones drift apart in an animation, raise the position threshold to 2 px: '
 					+ 'small offsets are then dropped, which is a known-good state.',
 			},
 		},
-		onConfirm(form) { this.hide(); onReady(form); },
+		onConfirm(form) {
+			if (fixedTarget) {
+				form.target = fixedTarget;
+			} else {
+				try { localStorage.setItem(TARGET_KEY, form.target); } catch (e) { /* only a convenience */ }
+				// The dialog stays open behind the message, so another format can be
+				// picked without choosing the files — or downloading them — again.
+				if (form.target === 'geckolib_model' && !requireGeckolib()) return false;
+			}
+			this.hide();
+			onReady(form);
+		},
 	}).show();
 }
 
 /**
- * Whether the GeckoLib format exists. That plugin installs separately, and
- * without it there is nothing to build a project into.
- *
- * The dependency is deliberately soft: the mesh-to-cube converter is useful on
- * its own, so the plugin always loads and the check sits where the format is
- * actually needed — at the entrance to the import.
+ * Whether the GeckoLib format exists. That plugin installs separately, and it
+ * is needed only when GeckoLib is the format chosen: the other formats come
+ * with Blockbench, so the plugin always loads and the check sits at that choice.
  */
 function geckolibAvailable() {
 	return typeof Formats !== 'undefined' && !!Formats.geckolib_model;
 }
 
+/**
+ * The two catalog plugins that provide the `geckolib_model` format. The first
+ * stops at Blockbench 5.0 and the second starts there, so naming only the old
+ * one sent Blockbench 5 users to a plugin that refuses to install.
+ */
+const GECKOLIB_PLUGINS = [
+	{ id: 'geckolib', title: 'GeckoLib Models & Animations' },
+	{ id: 'animation_utils', title: 'GeckoLib Animation Utils' },
+];
+
+/**
+ * Which of them to send the user to. The catalog decides — the entry that says
+ * it installs on this build — and the version only when the catalog has not
+ * loaded (offline, or still on its way).
+ */
+function geckolibPlugin() {
+	try {
+		for (const g of GECKOLIB_PLUGINS) {
+			const entry = Plugins.all.find(p => p.id === g.id);
+			if (entry && entry.isInstallable() === true) return { id: g.id, title: g.title, entry };
+		}
+	} catch (e) { /* no catalog: decided by the version below */ }
+	let older = false;
+	try { older = Blockbench.isOlderThan('5.0.0'); } catch (e) { /* assume a current build */ }
+	const g = GECKOLIB_PLUGINS[older ? 1 : 0];
+	return { id: g.id, title: g.title, entry: null };
+}
+
 function requireGeckolib() {
 	if (geckolibAvailable()) return true;
+	const need = geckolibPlugin();
+	const installed = need.entry && need.entry.installed;
+	const advice = !installed
+		? `Install <b>${need.title}</b> from File → Plugins and run the import again.`
+		: need.entry.disabled
+			? `<b>${need.title}</b> is installed but disabled: enable it in File → Plugins `
+				+ 'and run the import again.'
+			: `<b>${need.title}</b> is installed, but its format did not register: `
+				+ 'check the plugin list for an error, or restart Blockbench.';
 	new Dialog({
 		id: PLUGIN_ID + '_need_geckolib',
 		title: 'GeckoLib plugin required',
 		buttons: ['Open plugin list', 'Cancel'],
 		lines: [
-			'<p>The import builds a project in the <b>GeckoLib Animated Model</b> format, '
-			+ 'which comes from a separate plugin — and it is not installed right now.</p>'
-			+ '<p style="opacity:0.75">Install <b>GeckoLib Animation Utils</b> from '
-			+ 'File → Plugins and run the import again. Converting an already-open model '
-			+ 'from meshes to cubes (Filter menu) works without it.</p>',
+			'<p>The <b>GeckoLib Animated Model</b> format comes from a separate plugin, '
+			+ 'and it is not available right now.</p>'
+			+ `<p style="opacity:0.75">${advice} Or pick another format in the import dialog: `
+			+ 'the others come with Blockbench.</p>',
 		],
 		onConfirm() {
 			this.hide();
@@ -4598,6 +5286,13 @@ function requireGeckolib() {
 				if (typeof Plugins !== 'undefined' && Plugins.dialog) Plugins.dialog.show();
 				else if (typeof BarItems !== 'undefined' && BarItems.plugins_window) BarItems.plugins_window.click();
 			} catch (e) { /* not critical: the user can open it manually */ }
+			// Blockbench 5 can open the list on the plugin's own page; older builds
+			// have no such call and just show the list.
+			try {
+				const list = Plugins.dialog.content_vue;
+				if (need.entry) list.selectPlugin(need.entry);
+				if (need.entry) list.setTab(installed ? 'installed' : 'available');
+			} catch (e) { /* the list is open either way */ }
 		},
 		onCancel() { this.hide(); },
 	}).show();
@@ -4607,8 +5302,8 @@ function requireGeckolib() {
 function importFromZip() {
 	// No JSZip check here any more: it is only needed for an archive, and an
 	// unpacked folder goes in without it. The check moved to where the archive
-	// is actually opened.
-	if (!requireGeckolib()) return;
+	// is actually opened. Nor a GeckoLib check: the format is chosen in the
+	// dialog, and only that choice needs the plugin.
 	askImportOptions(opts => pickAndImport(opts));
 }
 
@@ -4631,14 +5326,14 @@ function importCPMFromZip() {
 		Blockbench.showMessageBox({ title: 'JSZip missing', message: 'This Blockbench build has no JSZip, so archives cannot be unpacked.' });
 		return;
 	}
-	// The GeckoLib format is needed even here, because the import builds its
-	// project in it. Nothing in the CPM output depends on GeckoLib — that is a
-	// rough edge of reusing the import whole, not a property of the format.
-	if (!requireGeckolib()) return;
+	// The project is built as a Generic model: it only has to exist for the
+	// measurement, nothing in the CPM output depends on its format, and Generic
+	// ships with every Blockbench. It used to be GeckoLib, which made the CPM
+	// export demand a plugin it never used.
 	askImportOptions(opts => pickAndImport(opts, built => {
 		if (!built) return;
 		askCPMOptions(built, form => saveCPMProject(built, form));
-	}));
+	}), 'free');
 }
 
 /**
@@ -4656,13 +5351,19 @@ function importCPMFromZip() {
 function askCPMOptions(built, onReady) {
 	const hierarchy = built.parsed.hierarchy;
 	const guess = cpmAutoAssign(hierarchy);
+	const tidy = built.tidy;
 
 	// Only the bones worth asking about: the ones the guess spoke for, plus the
 	// top of the tree. Thirty-two selects would be a cockpit, and the rest of the
 	// bones inherit their parent's part anyway.
-	const roots = hierarchy.filter(h => h.parent < 0).map(h => h.index);
+	//
+	// The top of the tree is the tidied one, as in the outliner. The file's own top
+	// is the export wrapper, so a Sketchfab model used to be asked about
+	// "Sketchfab_model" and "root" first.
+	const parentOf = h => (tidy ? (tidy.parent.has(h.index) ? tidy.parent.get(h.index) : null) : h.parent);
+	const roots = hierarchy.filter(h => parentOf(h) === -1).map(h => h.index);
 	const candidates = hierarchy.filter(h => guess[h.index] || roots.includes(h.index)
-		|| (h.parent >= 0 && roots.includes(h.parent)));
+		|| roots.includes(parentOf(h)));
 
 	const options = { '': 'inherit from parent' };
 	for (const p of CPM_PART_NAMES) options[p] = p.replace('_', ' ');
@@ -4696,7 +5397,7 @@ function askCPMOptions(built, onReady) {
 	};
 	for (const h of candidates) {
 		form['b_' + h.index] = {
-			label: h.name, type: 'select',
+			label: tidy ? tidy.label(h.index) : h.name, type: 'select',
 			default: guess[h.index] || '',
 			options,
 		};
@@ -4797,8 +5498,12 @@ function askCPMOptions(built, onReady) {
 
 /** Builds the archive and hands it to Blockbench to save. */
 function saveCPMProject(built, form) {
+	// Names as in the outliner: the author's, not the exporter's.
+	const tidy = built.tidy;
 	const cubes = built.solved.map((s, i) => ({
-		name: s.obj.name,
+		name: tidy
+			? tidy.cubeName(s.obj.node, s.obj.baseName || s.obj.name) + (s.obj.part ? `_${s.obj.part}` : '')
+			: s.obj.name,
 		node: s.obj.node,
 		sol: s.sol,
 		inflate: 0,
@@ -4831,7 +5536,9 @@ function saveCPMProject(built, form) {
 
 	cpmSkinBytes(built).then(skin => {
 		const out = buildCPMFiles({
-			hierarchy: built.parsed.hierarchy,
+			hierarchy: tidy
+				? built.parsed.hierarchy.map(h => ({ ...h, name: tidy.label(h.index) }))
+				: built.parsed.hierarchy,
 			cubes,
 			assign: form.assign,
 			fallback: form.fallback,
@@ -5072,7 +5779,7 @@ function registerStartScreenFormat() {
 		if (typeof ModelFormat === 'undefined') { startScreenStatus = 'ModelFormat unavailable'; return; }
 		importFormat = new ModelFormat({
 			id: PLUGIN_ID + '_zip',
-			name: 'glTF to GeckoLib',
+			name: 'glTF to Minecraft',
 			description: 'glTF + textures → a ready cube-based model',
 			icon: 'folder_zip',
 			category: 'general',
@@ -5084,10 +5791,11 @@ function registerStartScreenFormat() {
 			content: [
 				{ type: 'h3', text: 'Model from a glTF archive or folder' },
 				{ type: 'text', text: 'Takes a .zip with a glTF model and its textures — or the files of an '
-					+ 'already unpacked folder — and builds a finished GeckoLib project: bones, '
-					+ 'cubes, textures and animations.' },
-				{ type: 'text', text: 'Requires the GeckoLib Animation Utils plugin — its format is '
-					+ 'what the project is built into.' },
+					+ 'already unpacked folder — and builds a finished project: bones, cubes, '
+					+ 'textures and animations.' },
+				{ type: 'text', text: 'The format is chosen in the import dialog: GeckoLib, Bedrock Entity, '
+					+ 'Generic Model, or a still Java block or item model. GeckoLib needs its own plugin '
+					+ '(GeckoLib Models & Animations on Blockbench 5); the others come with Blockbench.' },
 				{ type: 'text', text: 'Cube-based models work best. Cubes merged into a single mesh are '
 					+ 'split apart automatically, and several textures are packed into one atlas.' },
 				{ type: 'text', text: 'Wedges, bevels and rounded shapes do not exist in Minecraft: such '
@@ -5184,11 +5892,12 @@ Plugin.register(PLUGIN_ID, {
 	title: 'glTF to Minecraft',
 	author: 'MopicMP',
 	icon: 'view_in_ar',
-	description: 'Convert glTF models — from an archive, a folder or straight from Sketchfab — into cubes Minecraft can use: a GeckoLib model or a Customizable Player Models skin, with bones, textures and animations.',
-	version: '0.1.2',
+	description: 'Convert glTF models — from an archive, a folder or straight from Sketchfab — into cubes Minecraft can use: GeckoLib and Bedrock models with bones and animations, still Java block and item models, or Customizable Player Models skins.',
+	version: '0.2.0',
 	variant: 'both',
 	min_version: '4.9.0',
-	tags: ['Minecraft: Java Edition', 'Import', 'Animation'],
+	has_changelog: true,
+	tags: ['Minecraft: Java Edition', 'Minecraft: Bedrock Edition', 'Import', 'Animation'],
 	website: 'https://github.com/MopicMP/gltf-to-minecraft',
 	repository: 'https://github.com/MopicMP/gltf-to-minecraft',
 	bug_tracker: 'https://github.com/MopicMP/gltf-to-minecraft/issues',
@@ -5237,8 +5946,8 @@ Plugin.register(PLUGIN_ID, {
 		// the bare File menu they landed at its very bottom, away from every other
 		// import, and looked out of place there.
 		importAction = new Action(PLUGIN_ID + '_import', {
-			name: 'Import glTF as GeckoLib Model',
-			description: 'Builds a ready GeckoLib model from a glTF archive, or from the files of an unpacked folder',
+			name: 'Import glTF Model',
+			description: 'Builds a cube model from a glTF archive or an unpacked folder: GeckoLib, Bedrock, Generic or Java block/item',
 			icon: 'folder_zip',
 			// the import creates a project itself, so it needs no open project
 			condition: () => true,

@@ -52,9 +52,39 @@ The plugin's own Sketchfab download requests it automatically.
 
 ## "GeckoLib plugin required"
 
-The project is built in the GeckoLib format, so the **GeckoLib Animation Utils**
-plugin must be installed. Converting an already open model (*Filter > Convert
-Meshes to Cubes*) works without it.
+GeckoLib was chosen as the format, and it comes from a plugin of its own:
+**GeckoLib Models & Animations** on Blockbench 5, **GeckoLib Animation Utils** on
+Blockbench 4. The old one does not install on Blockbench 5. *Open plugin list* in
+the message opens the list on the right one. If it says the plugin is installed
+but disabled, enable it there. The import dialog stays open behind the message,
+so another format can be picked instead: Bedrock, Generic and Java need no plugin.
+
+## A Java model shows up broken in the game
+
+**Cause:** cubes turned on several axes, or past 45°, exist in Java models only
+from Minecraft 1.21.11; any angle on one axis, from 1.21.6. An older game does
+not show them as built. The import report says which version the model needs.
+
+**What to do:** use that version or newer, or pick a model built from unturned
+cubes.
+
+## A Java model came out smaller than expected
+
+**Cause:** a Java block or item model has to fit −16…32 on each axis — three
+blocks. A larger model is shrunk to fit, and the report says by how much.
+
+**What to do:** nothing, if the size is fine; the item's display settings in
+Blockbench can scale it back up in hand or on the head. For a model that must
+stay big, build into GeckoLib or Bedrock instead.
+
+## A card says "probably not built from cubes"
+
+**Cause:** the model's corners are shared, as on smooth and bevelled meshes. The
+`blockbench` tag does not rule that out: anyone can set it, and Blockbench makes
+meshes too.
+
+**What to do:** expect slopes and curves to become boxes, or pick a model with the
+cube icon. With no icon the counts cannot tell either way.
 
 ## The CPM export is over 30 kB
 

@@ -11,7 +11,7 @@
  */
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
-const { hasGltfArchive, sketchfabSearchURL } = require('../plugin/gltf_to_minecraft.js');
+const { hasGltfArchive, sketchfabSearchURL, cubeHint } = require('../plugin/gltf_to_minecraft.js');
 
 let bad = 0;
 const ok = (cond, msg) => { if (!cond) bad++; console.log(`  ${cond ? '✅' : '❌'} ${msg}`); };
@@ -41,6 +41,24 @@ ok(/downloadable=true/.test(withTag) && /downloadable=true/.test(without),
 ok(/q=girl/.test(sketchfabSearchURL('girl', true)), 'the query itself is not lost');
 ok(/q=&|q=$/.test(sketchfabSearchURL('', true)), 'an empty query gives an empty q, not undefined');
 
+// The Animated box: off by default, and independent of the tag.
+const animated = sketchfabSearchURL('girl', true, true);
+ok(/[?&]animated=true(&|$)/.test(animated), 'with Animated the request has animated=true');
+ok(!/animated=/.test(withTag), 'without it the request has no animated parameter');
+ok(/tags=blockbench/.test(animated), 'Animated does not drop the blockbench tag');
+ok(/animated=true/.test(sketchfabSearchURL('girl', false, true)) && !/tags=/.test(sketchfabSearchURL('girl', false, true)),
+	'Animated works without the tag as well');
+
+// The card's cube sign. Sketchfab counts vertex positions: a separate cube is 8
+// of them to 12 triangles. The numbers are from real search results.
+console.log('\n=== Built from cubes? ===');
+ok(cubeHint(144, 96) === 'cubes', 'a player of 12 separate cubes (144 triangles, 96 vertices): cubes');
+ok(cubeHint(10980, 7320) === 'cubes', 'exactly 2:3 at any size: cubes');
+ok(cubeHint(212, 92) === 'shapes', 'shared corners, 0.43 vertices per triangle (a bevelled house): not cubes');
+ok(cubeHint(388, 234) === null, 'in between, 0.60: no claim either way');
+ok(cubeHint(18, 13) === null, 'above 2:3, as with faces left out or flat planes: no claim');
+ok(cubeHint(0, 0) === null && cubeHint(undefined, 8) === null, 'missing counts: no claim');
+
 const hasTag = m => (m.tags || []).some(t => t.name === 'blockbench' || t.slug === 'blockbench');
 
 if (process.argv.includes('--live')) {
@@ -57,6 +75,12 @@ if (process.argv.includes('--live')) {
 		console.log(`  with the filter, tagged: ${t1} of ${(tagged.results || []).length}`);
 		ok((tagged.results || []).length > 0, 'the filter does not wipe out all results');
 		ok(t1 === (tagged.results || []).length, 'with the filter every model carries the tag');
+		// The card's cube sign on the same page: if Sketchfab ever stopped sending the
+		// counts, or started counting vertices differently, nothing would read as cubes.
+		const hints = (tagged.results || []).map(m => cubeHint(m.faceCount, m.vertexCount));
+		const cubes = hints.filter(h => h === 'cubes').length, shapes = hints.filter(h => h === 'shapes').length;
+		console.log(`  cube sign: cubes ${cubes}, probably not cubes ${shapes}, no claim ${hints.length - cubes - shapes}`);
+		ok(cubes > 0, 'some tagged models read as cubes (the sign is alive)');
 		// "Show more" follows the ready-made next link from the response. If it lost the
 		// parameter, the first page would be from Blockbench and the second — anything.
 		if (tagged.next) {
@@ -65,6 +89,33 @@ if (process.argv.includes('--live')) {
 			const t2 = (second.results || []).filter(hasTag).length;
 			console.log(`  second page: tagged ${t2} of ${(second.results || []).length}`);
 			ok(t2 === (second.results || []).length, 'on the second page every model carries the tag too');
+		}
+	} catch (e) {
+		console.log(`  network unavailable or the API changed: ${e.message}`);
+		console.log('  (not a test failure — the live check was skipped)');
+	}
+
+	// The same for Animated, with the plugin's own URL. The cards show the count
+	// from animationCount, so that is what has to be non-zero.
+	console.log('\n=== Animated on real results ===');
+	try {
+		const page = async u => { const r = await fetch(u); if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); };
+		const moving = m => Number(m.animationCount) > 0;
+		const plain = await page(withTag);
+		const anim = await page(animated);
+		const p1 = (plain.results || []).filter(moving).length;
+		const a1 = (anim.results || []).filter(moving).length;
+		console.log(`  without the filter, animated: ${p1} of ${(plain.results || []).length}`);
+		console.log(`  with the filter, animated: ${a1} of ${(anim.results || []).length}`);
+		ok((anim.results || []).length > 0, 'the filter does not wipe out all results');
+		ok(a1 === (anim.results || []).length, 'with the filter every model has an animation');
+		ok((anim.results || []).every(m => typeof m.faceCount === 'number'), 'every result carries faceCount for the card');
+		if (anim.next) {
+			ok(/animated=true/.test(anim.next) && /tags=blockbench/.test(anim.next), 'the next link keeps both filters');
+			const second = await page(anim.next);
+			const a2 = (second.results || []).filter(moving).length;
+			console.log(`  second page: animated ${a2} of ${(second.results || []).length}`);
+			ok(a2 === (second.results || []).length, 'on the second page every model has an animation too');
 		}
 	} catch (e) {
 		console.log(`  network unavailable or the API changed: ${e.message}`);

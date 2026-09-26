@@ -22,6 +22,18 @@ with no images at all. The one declaring the most images is chosen, and the
 choice is written to the report. Taking whichever came first used to import an
 untexturable model depending on the order of names.
 
+**The outliner.** Every glTF node could become a folder, and a Sketchfab export
+nests them deep: three wrapper nodes, then each cube in a node of its own, inside
+a node that only holds its mesh. A folder is dropped when it has no animation and
+holds one thing or nothing; its content moves up to its parent. That changes no
+shape: bones stand unrotated, so a folder nothing animates moves nothing. The
+wrapper goes whatever it holds. A cube whose node went takes the innermost
+author's name on its way up, skipping names an exporter makes up
+(`_gltfNode_2`, `Object_104`). Sketchfab appends `_N` to every node name; when
+every name carries such a number, one is taken off, and bone names that then
+repeat get a number back. [`tools/verify-outliner.mjs`](../tools/verify-outliner.mjs)
+checks that no animated node is lost on any local model.
+
 **Primitive modes.** Triangles (`mode 4`), triangle strips (`5`) and fans (`6`)
 are all read. Every second triangle of a strip is stored reversed and is turned
 back. A strip jumps from face to face by repeating an index; such a *stitch*
@@ -69,7 +81,7 @@ fallback for Node. A mirror is written as a reversed rectangle (`x1 > x2`).
 **Colour and auxiliary maps.** Normal, roughness, occlusion and emissive maps are
 meaningless in Minecraft and are skipped.
 
-**One texture per model.** GeckoLib takes one, so several colour images are packed
+**One texture per model.** GeckoLib and Bedrock take one, so several colour images are packed
 into an atlas (shelf packing into power-of-two sides) and each object's UV is
 moved into its rectangle. Two things decide what goes in:
 
@@ -81,6 +93,21 @@ moved into its rectangle. Two things decide what goes in:
 - an object that **names no image at all** gets the main image's rectangle.
   Without it, its UV were multiplied by the whole atlas and the model arrived in a
   stretched mix of every picture.
+
+**Per face, not per object.** A mesh may carry several primitives on different
+materials — older Blockbench exports every face of a cube as one — so each
+primitive's UV go into its own image's rectangle. The image used to be taken from
+the first primitive for all of them, and a cube whose first face had no texture
+arrived invisible.
+
+**Faces with no texture.** Blockbench exports an untextured face on a stand-in: a
+1×1 picture whose one pixel is transparent. It is recognised by its pixels — the
+PNG is inflated by a small decoder in the plugin, checked byte for byte against
+zlib in [`tools/verify-per-face-textures.mjs`](../tools/verify-per-face-textures.mjs)
+— and only when every sample is zero and zero means transparent. Such faces keep
+their geometry but no UV, so they stay hidden as they were; the stand-in stays out
+of the atlas; an object made only of such faces, which is what Sketchfab's
+conversion makes of them, is left out.
 
 **Lost alpha.** A Minecraft-style figure has an outer shell that is transparent
 wherever it is unused. If the texture has no alpha channel while the material
@@ -125,6 +152,9 @@ The CPM import runs the same conversion and then writes a `.cpmproject` itself �
 a ZIP with `config.json`, `skin.png`, `description.json` and one JSON per
 animation.
 
+- **Names** follow the outliner: the dialog and the elements carry the tidied
+  names, and the dialog asks about the top of the tidied tree, not the export
+  wrapper.
 - **Roots are player parts** (`head`, `body`, `left_arm`, …), not the model's own
   bones; everything is hung under them. A root with any other name is what trips
   CPM's own Blockbench exporter (`Unknown root group`).
@@ -151,3 +181,40 @@ animation.
 The `.cpmproject` is read back by CPM's own rules in
 [`tools/verify-cpm.mjs`](../tools/verify-cpm.mjs): structure, limits, the eight
 corners of every box through the renderer's transform, and every animated pose.
+
+## 7. Formats
+
+The conversion does not depend on the format it lands in. A cube turned freely,
+per-face UV, bones and keyframes are what GeckoLib, Bedrock entities and Generic
+models all take, and the UV convention is measured on whichever project is open.
+Only the project's format changes:
+
+- **Bedrock Entity** gets a geometry identifier from the model's name; an empty
+  one would export as `geometry.unknown`.
+- **Generic Model** measures UV against each texture's own size, so the atlas is
+  given its size explicitly rather than when it finishes drawing.
+- **Customizable Player Models** builds its intermediate project as a Generic
+  model: it exists only to measure on, and Generic ships with Blockbench.
+
+Modded Entity and OptiFine are not offered: both require box UV or whole-pixel
+sizes, and neither can turn a single cube.
+
+**Java block and item models** take the cubes too, but have no bones and do not
+animate: animations are left out and the report counts them. Two more things
+follow from the format:
+
+- **The box.** Every element's from/to must lie within −16…32 on each axis, and
+  inflate counts, because the export bakes it into from/to. The bounds are taken
+  from the cubes' from/to, not from their corners: a turned cube's from/to are its
+  unturned box, which reaches further. With centring on, the model stands like a
+  block — X and Z centred on it, the bottom on its floor. It is then pushed back
+  inside, and shrunk only if it is larger than the box itself: moving by whole
+  pixels keeps a model on its grid, shrinking does not.
+- **The version.** Blockbench writes Java rotations in three ways, keyed to the
+  project's format version: one axis in 22.5° steps within ±45° (1.9 and later),
+  any angle on one axis within ±45° (1.21.6), and any rotation on all three axes
+  (1.21.11). The import finds the oldest one that holds every cube, raises the
+  project to it if the user's default is older, and reports it. A Blockbench too
+  old to write free rotations says how many cubes it will snap.
+
+Both are checked in [`tools/verify-java-fit.mjs`](../tools/verify-java-fit.mjs).

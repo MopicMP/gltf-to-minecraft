@@ -7,12 +7,14 @@ it. The report can be saved to a file from its window.
 
 **Cause:** the texture lost its alpha channel. A Minecraft-style figure has an
 outer shell that is transparent wherever it is unused; without alpha that shell
-becomes solid and hides the body. The report says *Texture without an alpha
-channel, though the material asks for transparency*.
+becomes solid and hides the body. The report says *The material asks for
+transparency, but the texture has no alpha channel*.
 
 **What to do:** download the model through *File > Import > Import from
-Sketchfab*, which keeps the textures as they are. A channel lost somewhere along
-the way cannot be recovered from the file.
+Sketchfab*: for a model uploaded from Blockbench it takes the author's original,
+whose texture keeps its alpha (see *Some faces are black on a model from
+Sketchfab*). A channel lost somewhere along the way cannot be recovered from the
+file.
 
 ## The whole model wears one texture
 
@@ -20,16 +22,37 @@ the way cannot be recovered from the file.
 the other images have nothing to land on. The report says *Colour textures no mesh
 references: N of M*. Nothing in such a file tells which part each image belongs to.
 
-## The model is a pile of blocks
+## The model is a pile of blocks, or of thin plates
 
 **Cause:** it is not made of boxes. Sculpted and scanned models have no cubes in
-them; each object is replaced with its bounding box. The report gives the share:
-*Not boxes: N — replaced with their bounding box*, and at 30% or more it says the
-model is a poor fit.
+them. By default each such part is rebuilt from plates that follow its surface —
+*Not boxes: N — rebuilt from plates* — which keeps the shape but multiplies the
+cubes; with *Approximate with a bounding box* in the advanced settings each part
+becomes one block instead.
 
 **What to do:** choose models built from cubes. The Sketchfab search lists only
 models tagged `blockbench` by default (*Made in Blockbench*) — those convert
 whole.
+
+## Some faces are black on a model from Sketchfab
+
+**Cause:** Sketchfab's own conversion to glTF can drop a texture's transparency
+together with the material's `alphaMode`: what was see-through — windows, the
+unused sides of a cube — comes out solid black, and nothing in the file says it
+was ever clear. Guessing it back from the colour would punch holes in real black.
+
+**What to do:** for a model uploaded straight from Blockbench, the plugin's
+Sketchfab search already downloads the author's original, which keeps the
+transparency; the report then says *Downloaded: the author's original*. When
+downloading by hand, pick *Original format* for such a model: it holds
+Blockbench's own glTF and imports as is.
+
+## An outline around a part is missing
+
+**Cause:** the outline was an inside-out copy of the part on a one-sided material,
+drawn only from behind. Minecraft draws cubes from both sides, where such a copy
+would cover the part with a dark casing, so it is left out; the report says
+*Outline shells left out: N*.
 
 ## The model lies on its side or faces the wrong way
 
@@ -91,3 +114,18 @@ cube icon. With no icon the counts cannot tell either way.
 A local `.cpmmodel` holds 30 kB; animations take most of it. Transfer fewer
 animations or lower the sampling rate. *File > Test ingame* in CPM works at any
 size.
+
+## "Cannot add the model"
+
+Adding to the open project redraws the project texture with the model's beside
+it, and three textures cannot be redrawn that way: one with **layers** (they would
+be merged), an **animated** one (its frames would break), and one that **never
+loaded**. Merge the layers into one, or build the model as a new project and copy
+it over.
+
+## The project texture file did not change
+
+After adding to a GeckoLib or Bedrock project the texture in Blockbench holds both
+pictures, but the file on disk does not until the texture itself is saved, from
+the Textures panel. Saving the project alone keeps the picture inside the
+project file.

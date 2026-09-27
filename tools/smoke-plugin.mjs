@@ -15,6 +15,11 @@
 import fs from 'node:fs';
 import vm from 'node:vm';
 import path from 'node:path';
+import { createRequire } from 'node:module';
+
+// The plugin's pure functions, as the other tools load them: the sandbox runs
+// the plugin inside a closure, so nothing in it can be reached from here.
+const lib = createRequire(import.meta.url)('../plugin/gltf_to_minecraft.js');
 
 // ------------------------------------------------------------ mini-THREE
 
@@ -93,6 +98,13 @@ const THREE = {
 // ------------------------------------------------- stubbing the Blockbench objects
 
 const created = { cubes: [], groups: [], animations: [], textures: [] };
+// What an open project already holds when a model is added to it; empty while
+// every import builds a project of its own.
+const openProject = { groups: [], textures: [], animations: [], elements: [] };
+// Undo calls, canvas drawing and texture fills, in the order they happened.
+const undoLog = [];
+const eventLog = [];
+const canvasLog = [];
 let reportShown = null;
 const problems = [];
 
@@ -107,17 +119,26 @@ class Cube {
 		for (const f of ['north', 'south', 'east', 'west', 'up', 'down']) this.faces[f] = { uv: null, texture: null };
 		this.mesh = new FakeMeshObj();
 		// cube geometry of 24 vertices — the way Blockbench gives it, relative to origin
+		//
+		// Each face's UV grow along the directions Blockbench 5 was measured to use
+		// (the plugin's own fallback table), with V flipped as in WebGL. The probe
+		// then measures a real convention. It used to lay u and v along the same
+		// two axes on every face, and the table measured from that made the box
+		// solver pick among orientations by float noise: a model moved by a few
+		// pixels came out with other faces collapsed to lines.
 		const pos = [], uv = [];
 		const h = [8, 8, 8];
 		const faces = [[0, 1], [0, -1], [1, 1], [1, -1], [2, 1], [2, -1]];
+		const dot = (p, d) => p[0] * d[0] + p[1] * d[1] + p[2] * d[2];
 		for (const [axis, sign] of faces) {
+			const dirs = Object.values(lib.FACE_DIRS).find(d => d.normal[axis] === sign);
 			for (const [a, b] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) {
 				const p = [0, 0, 0];
 				p[axis] = sign * h[axis];
 				p[(axis + 1) % 3] = a * h[(axis + 1) % 3];
 				p[(axis + 2) % 3] = b * h[(axis + 2) % 3];
 				pos.push(...p);
-				uv.push(a > 0 ? 4 / 128 : 0, 1 - (b > 0 ? 8 / 128 : 0));
+				uv.push(dot(p, dirs.u) > 0 ? 4 / 128 : 0, 1 - (dot(p, dirs.v) > 0 ? 8 / 128 : 0));
 			}
 		}
 		this.mesh.geometry = {
@@ -128,8 +149,9 @@ class Cube {
 		};
 	}
 	init() { created.cubes.push(this); return this; }
-	addTo() { return this; }
-	remove() { }
+	addTo(p) { this.parent = p; return this; }
+	// probes go away again, as they do in Blockbench
+	remove() { const i = created.cubes.indexOf(this); if (i >= 0) created.cubes.splice(i, 1); }
 }
 
 class Group {
@@ -141,9 +163,12 @@ class Group {
 		this.children = [];
 	}
 	init() { created.groups.push(this); return this; }
-	addTo(p) { if (p && p.children) p.children.push(this); return this; }
-	remove() { }
+	addTo(p) { if (p && p.children) p.children.push(this); this.parent = p; return this; }
+	remove() { const i = created.groups.indexOf(this); if (i >= 0) created.groups.splice(i, 1); }
+	select() { Group.first_selected = this; return this; }
 }
+Group.first_selected = null;
+Object.defineProperty(Group, 'all', { get: () => [...openProject.groups, ...created.groups] });
 
 class BoneAnimator {
 	constructor(name) { this.name = name; this.rotation = []; this.position = []; this.scale = []; }
@@ -163,20 +188,37 @@ class Animation {
 	add() { created.animations.push(this); return this; }
 	select() { Animation.selected = this; return this; }
 	setLength() { }
+	remove() { const i = created.animations.indexOf(this); if (i >= 0) created.animations.splice(i, 1); }
 	getBoneAnimator(group) {
 		const key = group.name || 'bone';
 		return this.animators[key] || (this.animators[key] = new BoneAnimator(key));
 	}
 }
 Animation.selected = null;
-Object.defineProperty(Animation, 'all', { get: () => created.animations });
+Object.defineProperty(Animation, 'all', { get: () => [...openProject.animations, ...created.animations] });
 
 class Texture {
 	constructor(data = {}) { Object.assign(this, data); this.uuid = 'tex-' + created.textures.length; }
-	fromDataURL(url) { this.url = url; return this; }
+	fromDataURL(url) { this.url = url; eventLog.push('fill ' + this.uuid); return this; }
 	add() { created.textures.push(this); return this; }
 }
-Object.defineProperty(Texture, 'all', { get: () => created.textures });
+Object.defineProperty(Texture, 'all', { get: () => [...openProject.textures, ...created.textures] });
+Texture.getDefault = () => Texture.all[0];
+
+/** A canvas that remembers its size and what was drawn on it, and where. */
+function fakeCanvas() {
+	const c = { width: 0, height: 0, draws: [] };
+	// blocks of ready pixels are counted: the baked sheets of rebuilt parts arrive that way
+	c.puts = 0;
+	c.getContext = () => ({
+		drawImage(img, ...at) { c.draws.push(at); }, imageSmoothingEnabled: false,
+		createImageData: (w, h) => ({ width: w, height: h, data: new Uint8ClampedArray(w * h * 4) }),
+		putImageData() { c.puts++; },
+	});
+	c.toDataURL = () => 'data:image/png;base64,AAAA';
+	canvasLog.push(c);
+	return c;
+}
 
 
 // ------------------------------------------------------- archive contents
@@ -335,6 +377,49 @@ function zipContents() {
         return files;
     }
 
+    // A part that is not a box: a prism of twelve sides standing beside the model.
+    // It goes the whole way the rebuild goes — decoding the picture, the plates,
+    // their sheets in the atlas, the progress window, the cubes and the report.
+    if (scenario === 'rounded') {
+        const gltf = JSON.parse(fs.readFileSync(gltfPath, 'utf8'));
+        // the picture the model reads: embedded in the file, not the loose one beside it
+        const img0 = gltf.images[0];
+        const tex = lib.decodePNG(new Uint8Array(img0.uri && img0.uri.startsWith('data:')
+            ? Buffer.from(img0.uri.slice(img0.uri.indexOf(',') + 1), 'base64')
+            : fs.readFileSync(texPath)));
+        // a pixel of the picture that shows, so the plates have something to wear
+        let at = 0;
+        while (at < tex.w * tex.h && tex.data[at * 4 + 3] < 255) at++;
+        const uv = [((at % tex.w) + 0.5) / tex.w, (Math.floor(at / tex.w) + 0.5) / tex.h];
+        const n = 12, r = 0.25, h = 0.5;
+        const ring = y => Array.from({ length: n }, (_, i) => [r * Math.cos(2 * Math.PI * i / n), y, r * Math.sin(2 * Math.PI * i / n)]);
+        const pos = [...ring(0), ...ring(h)];
+        const idx = [];
+        for (let i = 0; i < n; i++) { const j = (i + 1) % n; idx.push(i, j, n + j, i, n + j, n + i); }
+        for (let i = 1; i + 1 < n; i++) idx.push(0, i + 1, i, n, n + i, n + i + 1);
+        // turned to face outward, as an exporter writes it: inward on this
+        // one-sided material it would read as an outline shell and be left out
+        for (let k = 0; k < idx.length; k += 3) [idx[k + 1], idx[k + 2]] = [idx[k + 2], idx[k + 1]];
+        const P = Buffer.alloc(pos.length * 12), T = Buffer.alloc(pos.length * 8), I = Buffer.alloc(idx.length * 4);
+        pos.forEach((p, k) => { p.forEach((v, c) => P.writeFloatLE(v, k * 12 + c * 4)); T.writeFloatLE(uv[0], k * 8); T.writeFloatLE(uv[1], k * 8 + 4); });
+        idx.forEach((v, k) => I.writeUInt32LE(v, k * 4));
+        const b = gltf.buffers.length, v0 = gltf.bufferViews.length, a0 = gltf.accessors.length;
+        gltf.buffers.push({ byteLength: P.length + T.length + I.length, uri: 'data:application/octet-stream;base64,' + Buffer.concat([P, T, I]).toString('base64') });
+        gltf.bufferViews.push({ buffer: b, byteOffset: 0, byteLength: P.length }, { buffer: b, byteOffset: P.length, byteLength: T.length },
+            { buffer: b, byteOffset: P.length + T.length, byteLength: I.length });
+        gltf.accessors.push(
+            { bufferView: v0, componentType: 5126, count: pos.length, type: 'VEC3', min: [-r, 0, -r], max: [r, h, r] },
+            { bufferView: v0 + 1, componentType: 5126, count: pos.length, type: 'VEC2' },
+            { bufferView: v0 + 2, componentType: 5125, count: idx.length, type: 'SCALAR' });
+        gltf.meshes.push({ primitives: [{ mode: 4, attributes: { POSITION: a0, TEXCOORD_0: a0 + 1 }, indices: a0 + 2, material: 0 }] });
+        gltf.nodes.push({ name: 'column', mesh: gltf.meshes.length - 1, translation: [2, 0, 0] });
+        const root = gltf.nodes[gltf.scenes[gltf.scene || 0].nodes[0]];
+        root.children = [...(root.children || []), gltf.nodes.length - 1];
+        files['source/model.gltf'] = new Uint8Array(Buffer.from(JSON.stringify(gltf), 'utf8'));
+        files['textures/gltf_embedded_0.png'] = new Uint8Array(fs.readFileSync(texPath));
+        return files;
+    }
+
     if (scenario === 'png') {
         files['source/model.gltf'] = new Uint8Array(fs.readFileSync(gltfPath));
         files['textures/gltf_embedded_0.png'] = new Uint8Array(fs.readFileSync(texPath));
@@ -419,7 +504,11 @@ const sandbox = {
 		else delete sandbox.Project.java_block_version;
 		return true;
 	},
-	Undo: { initEdit() { }, finishEdit() { } },
+	Undo: {
+		initEdit(aspects) { undoLog.push({ kind: 'init', aspects }); },
+		finishEdit(message, aspects) { undoLog.push({ kind: 'finish', message, aspects }); eventLog.push('finish'); },
+	},
+	Outliner: { get elements() { return [...openProject.elements, ...created.cubes]; }, selected: [] },
 	Timeline: { setTime() { } },
 	Animator: { preview() { } },
 	Modes: { options: { edit: { select() { } } } },
@@ -501,11 +590,7 @@ const sandbox = {
 	document: {
 		querySelector: () => null,
 		createElement: (tag) => tag === 'canvas'
-			? {
-				width: 0, height: 0,
-				getContext: () => ({ drawImage() { }, imageSmoothingEnabled: false }),
-				toDataURL: () => 'data:image/png;base64,AAAA',
-			}
+			? fakeCanvas()
 			: { style: {}, classList: { add() { } }, addEventListener() { } },
 	},
 	Image: class { set src(v) { this._src = v; setTimeout(() => this.onload && this.onload(), 0); } },
@@ -625,6 +710,14 @@ const faceUV = () => created.cubes.map(c => JSON.stringify({
     faces: Object.entries(c.faces).map(([k, f]) => [k, f.uv, !!f.texture]),
 }));
 const facesPNG = faceUV();
+// The same, as numbers, with where the cubes stand: a model added to an open
+// project must read the same pixels, moved or scaled only as its texture was.
+const FACE_KEYS = ['north', 'south', 'east', 'west', 'up', 'down'];
+const uvsPNG = created.cubes.map(c => FACE_KEYS.map(f => c.faces[f].uv && c.faces[f].uv.slice()));
+const solidPNG = created.cubes.map(c => c.to.every((v, k) => Math.abs(v - c.from[k]) >= 0.01));
+const centreOf = cubes => [0, 1, 2].map(a => cubes.reduce((s, c) => s + (c.from[a] + c.to[a]) / 2, 0) / cubes.length);
+const centrePNG = centreOf(created.cubes);
+const atlasPNG = [sandbox.Project.texture_width, sandbox.Project.texture_height];
 const texturePNG = [sandbox.Project.texture_width, sandbox.Project.texture_height].join('×');
 void baseline;
 
@@ -708,6 +801,14 @@ if (!reportShown || reportShown.indexOf('Colour textures no mesh references: 1')
 } else {
     console.log('The report names the image nobody refers to: OK');
 }
+// Every part on one texture while another lies unused is a file that lost its
+// material links, and that is said up front, in the report's warning box.
+if (!reportShown || !/class="mtc_rep_warn">Every part of this file points at one texture/.test(reportShown)) {
+    failed = true;
+    console.log('❌ the report does not warn that the file lost its material links');
+} else {
+    console.log('The report warns that the file lost its material links: OK');
+}
 
 // --- objects that name no image at all: the UV must not spread across the atlas.
 //
@@ -780,7 +881,7 @@ importMode = 'zip';
 scenario = 'noalpha';
 failed = await runImport('the material asks for transparency, the texture does not carry it') || failed;
 
-if (!reportShown || reportShown.indexOf('without an alpha channel') < 0) {
+if (!reportShown || reportShown.indexOf('has no alpha channel') < 0) {
     failed = true;
     console.log('❌ the report has no line about the lost alpha');
 } else {
@@ -831,6 +932,34 @@ failed = await runImport('every mesh starts with an untextured face') || failed;
     else console.log(`Solid cubes read the same texture as without the placeholder, nothing reads outside it, texture ${size}: OK`);
 }
 
+// --- a part that is not a box, rebuilt from plates.
+scenario = 'rounded';
+failed = await runImport('a prism of twelve sides beside the model') || failed;
+// the rebuild waits on its window and gives way to the interface: let it finish
+for (let i = 0; i < 100 && !/Rebuilt, /.test(reportShown || ''); i++) await new Promise(r => setTimeout(r, 100));
+{
+    const bad = [];
+    const report = reportShown || '';
+    const line = /Rebuilt, fast: (\d+) parts → (\d+) plates/.exec(report);
+    if (!line) bad.push('the report says nothing about the rebuild');
+    else if (line[1] !== '1' || Number(line[2]) !== 14) bad.push(`rebuilt ${line[1]} parts into ${line[2]} plates, not 1 into 14`);
+    if (!/rebuilt from plates/.test(report)) bad.push('the not-a-box line does not say they were rebuilt');
+    if (!/need cutout transparency/.test(report)) bad.push('the report does not say the plates need cutout transparency');
+    // plates: flat, two sides showing, the four others hidden
+    const flat = created.cubes.filter(c => c.to.some((v, k) => Math.abs(v - c.from[k]) < 1e-9) && /^column/.test(c.name || ''));
+    if (flat.length !== 14) bad.push(`${flat.length} flat cubes named after the part, not 14`);
+    const twoSided = flat.filter(c => Object.values(c.faces).filter(f => f.texture).length === 2).length;
+    if (twoSided !== flat.length) bad.push(`${flat.length - twoSided} plates do not show exactly their two sides`);
+    const [tw, th] = [sandbox.Project.texture_width, sandbox.Project.texture_height];
+    const outside = created.cubes.reduce((n, c) => n + Object.values(c.faces)
+        .filter(f => f.texture && f.uv && f.uv.some((v, k) => v < -1e-6 || v > (k % 2 ? th : tw) + 1e-6)).length, 0);
+    if (outside) bad.push(`${outside} faces read outside the texture`);
+    if (tw * th <= atlasPNG[0] * atlasPNG[1]) bad.push(`the texture did not grow for the sheets: ${tw}×${th}`);
+    if (bad.length) { failed = true; console.log('❌ ' + bad.join('; ')); }
+    else console.log(`The prism came back as 14 plates, two-sided, their sheets in a ${tw}×${th} texture: OK`);
+}
+scenario = 'png';
+
 // --- the other formats. The conversion is the same; what differs is the project
 // it lands in, and for Java the box, the format version and the animations.
 scenario = 'png';
@@ -865,6 +994,258 @@ for (const target of ['bedrock', 'free', 'java_block']) {
 }
 formOverride = {};
 
+// --- adding to the open project. The same model goes into a project that
+// already has folders, a texture and animations of its own, and has to leave
+// them as they were: names kept apart, the old texture in its corner, the UV of
+// the cubes already there reading the same pixels, and one step to undo it all.
+console.log('');
+console.log('=== adding to the open project');
+{
+	const savedProject = sandbox.Project;
+	const savedFormat = sandbox.Format;
+	const FLAGS = {
+		geckolib_model: { single_texture: true },
+		bedrock: { single_texture: true },
+		free: { per_texture_uv_size: true },
+		java_block: {},
+		skin: { single_texture: true },
+	};
+	// the fixture archive is model(gltf).zip
+	const slug = 'model_gltf';
+	const DIALOG = 'gltf_to_minecraft_import_dialog';
+
+	/** Opens a project in `format` holding what is listed. */
+	const open = ({ format, uv, texture = null, cubes = 1, folders = [], animations = [], selected = null, extra = {} }) => {
+		sandbox.Format = Object.assign(Object.create(ALL_FORMATS[format] || { id: format }), FLAGS[format]);
+		sandbox.Project = { box_uv: true, texture_width: uv[0], texture_height: uv[1], name: 'hero', ...extra };
+		openProject.groups = folders.map(([name, origin]) => new Group({ name, origin }));
+		// painted at twice the UV size, as a 64×64 model on a 128×128 texture is
+		openProject.textures = texture
+			? [Object.assign(new Texture({ name: 'hero.png' }), { uuid: 'old', width: uv[0] * 2, height: uv[1] * 2, img: {}, path: 'hero.png' }, texture)]
+			: [];
+		openProject.elements = Array.from({ length: cubes }, () => ({ name: 'existing' }));
+		openProject.animations = animations.map(name => ({ name, animators: {} }));
+		Group.first_selected = selected ? openProject.groups.find(g => g.name === selected) : null;
+		undoLog.length = 0;
+		eventLog.length = 0;
+		canvasLog.length = 0;
+	};
+
+	/**
+	 * Whether these cubes read what the plain import read, carried to where the
+	 * plan puts the atlas; null when they do. Compared as sets of rectangles per
+	 * solid cube, as in the placeholder case: a model moved elsewhere can tip the
+	 * box solver to another of the equal orientations, which renames faces while
+	 * laying the same picture on the same box. A 0.001 px panel only has to read
+	 * inside the atlas.
+	 */
+	const uvCheck = plan => {
+		if (created.cubes.length !== uvsPNG.length) return `${created.cubes.length} cubes instead of ${uvsPNG.length}`;
+		const key = uv => [Math.min(uv[0], uv[2]), Math.min(uv[1], uv[3]), Math.max(uv[0], uv[2]), Math.max(uv[1], uv[3])]
+			.map(v => v.toFixed(3)).join(',');
+		const moved = uv => uv.map((v, j) => plan.offset[j % 2] + v * plan.scale[j % 2]);
+		const lo = plan.offset, hi = [0, 1].map(a => plan.offset[a] + atlasPNG[a] * plan.scale[a]);
+		let differ = 0, outside = 0;
+		created.cubes.forEach((c, i) => {
+			const now = FACE_KEYS.map(f => c.faces[f].uv).filter(Boolean);
+			outside += now.filter(uv => uv.some((v, j) => v < lo[j % 2] - 1e-6 || v > hi[j % 2] + 1e-6)).length;
+			if (!solidPNG[i]) return;
+			const was = uvsPNG[i].filter(Boolean).map(uv => key(moved(uv)));
+			for (const k of now.map(key)) {
+				const at = was.indexOf(k);
+				if (at < 0) differ++; else was.splice(at, 1);
+			}
+			differ += was.length;
+		});
+		return differ || outside ? `${differ} rectangles of solid cubes differ, ${outside} read outside the atlas` : null;
+	};
+	const size = () => [sandbox.Project.texture_width, sandbox.Project.texture_height].join('×');
+	const mine = () => new Set(created.groups);
+	// the added folders hang from exactly one of them, which sits in `where`
+	const topOf = () => created.groups.filter(g => !mine().has(g.parent));
+	// The texture is drawn after the build, and a long build can outlast the
+	// wait in runImport: what was queued behind it has to run before looking.
+	const settle = () => new Promise(r => setTimeout(r, 100));
+	const verdict = (label, bad) => {
+		if (bad.length) { failed = true; console.log(`❌ ${label}: ${bad.join('; ')}`); }
+		else console.log(`${label}: OK`);
+	};
+
+	// GeckoLib, one texture: the atlas goes beside the project's, into a folder.
+	{
+		const made = projectsMade.length;
+		open({
+			format: 'geckolib_model', uv: [64, 64], texture: {}, selected: 'arm',
+			folders: [['arm', [5, 22, 0]], ['Head', [0, 24, 0]], ['bone', [0, 0, 0]]],
+			animations: [`${slug}.post`],
+		});
+		formOverride = { add_to_open: true, add_animations: true };
+		failed = await runImport('added to a GeckoLib project, into the folder “arm”') || failed;
+		await settle();
+		await settle();
+		const bad = [];
+		const form = formsShown[DIALOG] || {};
+		if (!form.add_to_open) bad.push('the dialog does not offer it');
+		if (!String((form.about_open || {}).text).includes('“arm”')) bad.push('the dialog does not name the folder');
+		if (projectsMade.length !== made) bad.push('a new project was made');
+
+		const plan = lib.texturePlan('beside', [64, 64], atlasPNG);
+		if (size() !== plan.uvSize.join('×')) bad.push(`UV size ${size()}, not ${plan.uvSize.join('×')}`);
+		if (created.textures.length) bad.push(`${created.textures.length} new textures in a one-texture format`);
+		const old = openProject.textures[0];
+		if (!old.url) bad.push('the project texture was not redrawn');
+		const sheet = canvasLog.find(c => c.width === plan.uvSize[0] * 2 && c.height === plan.uvSize[1] * 2);
+		if (!sheet) {
+			bad.push(`no sheet at the texture's double resolution (canvases: ${canvasLog.map(c => c.width + '×' + c.height).join(', ')})`);
+		} else {
+			const want = [plan.offset[0] * 2, plan.offset[1] * 2, atlasPNG[0] * 2, atlasPNG[1] * 2].join();
+			if (String(sheet.draws[0]) !== '0,0,128,128') bad.push(`the old texture drawn at ${sheet.draws[0]}`);
+			if (String(sheet.draws[1]) !== want) bad.push(`the atlas drawn at ${sheet.draws[1]}, not ${want}`);
+		}
+		const uvBad = uvCheck(plan);
+		if (uvBad) bad.push(`UV are not the plain import's moved by [${plan.offset}]: ${uvBad}`);
+		const shift = centreOf(created.cubes).map((v, a) => v - centrePNG[a]);
+		if (shift.some((v, a) => Math.abs(v - [5, 22, 0][a]) > 1e-3)) bad.push(`moved by [${shift.map(v => +v.toFixed(3))}], not onto the pivot [5, 22, 0]`);
+
+		const names = Group.all.map(g => g.name);
+		const twice = [...new Set(names.filter((n, i) => names.indexOf(n) !== i))];
+		if (twice.length) bad.push('folder names repeat: ' + twice.join(', '));
+		const arm = openProject.groups[0];
+		const top = topOf();
+		if (top.length !== 1 || top[0].parent !== arm) bad.push(`${top.length} added folders at the top, ${top.filter(g => g.parent === arm).length} of them in “arm”`);
+		const loose = created.cubes.filter(c => !mine().has(c.parent)).length;
+		if (loose) bad.push(`${loose} cubes outside the added folders`);
+		if (Group.first_selected !== top[0]) bad.push('the added folder is not selected');
+
+		const had = new Set(openProject.animations.map(a => a.name));
+		const anims = created.animations.map(a => a.name);
+		if (!anims.length) bad.push('the animations were not added');
+		if (anims.some(n => had.has(n))) bad.push('an animation took a name the project had');
+		if (anims.some(n => !n.startsWith(slug + '.'))) bad.push('an animation does not carry the model name');
+
+		const starts = undoLog.filter(u => u.kind === 'init'), ends = undoLog.filter(u => u.kind === 'finish');
+		if (starts.length !== 1 || ends.length !== 1) {
+			bad.push(`undo: ${starts.length} starts, ${ends.length} ends`);
+		} else {
+			const a = ends[0].aspects;
+			if (a.elements.length !== created.cubes.length) bad.push('undo misses cubes');
+			if (!a.textures.includes(old) || !starts[0].aspects.textures.includes(old)) bad.push('undo misses the project texture');
+			if (a.animations.length !== created.animations.length) bad.push('undo misses animations');
+			if (!a.uv_mode || !starts[0].aspects.uv_mode) bad.push('undo misses the UV size');
+			const fill = eventLog.indexOf('fill old');
+			if (fill < 0 || fill > eventLog.indexOf('finish')) bad.push('undo was closed before the texture was drawn');
+		}
+		if (!(reportShown || '').includes('Added to: the open GeckoLib project, into the folder “arm”')) bad.push('the report does not say where it went');
+		verdict('Into a folder, beside the texture, names apart, one undo', bad);
+	}
+
+	// Bedrock with cubes but no texture yet: the sheet keeps room for their UV.
+	{
+		open({ format: 'bedrock', uv: [32, 32], cubes: 1 });
+		formOverride = { add_to_open: true };
+		failed = await runImport('added to a Bedrock project with cubes and no texture') || failed;
+		await settle();
+		const bad = [];
+		const plan = lib.texturePlan('beside', [32, 32], atlasPNG);
+		if (size() !== plan.uvSize.join('×')) bad.push(`UV size ${size()}, not ${plan.uvSize.join('×')}`);
+		const tex = created.textures[0];
+		if (created.textures.length !== 1 || !tex.url) bad.push('no texture was made and drawn');
+		else if (tex.uv_width !== plan.uvSize[0]) bad.push(`its UV width is ${tex.uv_width}`);
+		const sheet = canvasLog.find(c => c.width === plan.uvSize[0] && c.height === plan.uvSize[1]);
+		if (!sheet || sheet.draws.length !== 1) bad.push('the atlas was not drawn alone on a sheet of the new size');
+		const uvBad = uvCheck(plan);
+		if (uvBad) bad.push(uvBad);
+		if (created.animations.length) bad.push('animations were added unasked');
+		if (topOf().length !== 1 || topOf()[0].parent) bad.push('the model is not one folder at the top level');
+		verdict('No texture yet: drawn on a sheet that leaves the old UV room, no animations unasked', bad);
+	}
+
+	// Generic: every texture has its own UV size, so the atlas stays whole.
+	{
+		open({ format: 'free', uv: [16, 16], texture: {}, cubes: 2 });
+		formOverride = { add_to_open: true };
+		failed = await runImport('added to a Generic project') || failed;
+		await settle();
+		const bad = [];
+		const tex = created.textures[0];
+		if (created.textures.length !== 1) bad.push(`${created.textures.length} textures made`);
+		else if (tex.uv_width !== atlasPNG[0] || tex.uv_height !== atlasPNG[1]) bad.push(`its UV size is ${tex.uv_width}×${tex.uv_height}`);
+		if (size() !== '16×16') bad.push(`the project UV size changed to ${size()}`);
+		if (openProject.textures[0].url) bad.push('the project texture was redrawn');
+		const uvBad = uvCheck(lib.texturePlan('own', [16, 16], atlasPNG));
+		if (uvBad) bad.push(uvBad);
+		verdict('Generic: a texture of its own, the project texture untouched', bad);
+	}
+
+	// Java: one UV size for all textures; the model's UV are squeezed into it.
+	{
+		open({ format: 'java_block', uv: [16, 16], texture: {}, extra: { java_block_version: '1.21.6' } });
+		formOverride = { add_to_open: true };
+		failed = await runImport('added to a Java block model') || failed;
+		await settle();
+		const bad = [];
+		if (created.textures.length !== 1) bad.push(`${created.textures.length} textures made`);
+		if (size() !== '16×16') bad.push(`the project UV size changed to ${size()}`);
+		const uvBad = uvCheck(lib.texturePlan('shared', [16, 16], atlasPNG));
+		if (uvBad) bad.push(`UV are not squeezed into 16×16: ${uvBad}`);
+		const outside = created.cubes.filter(c => [0, 1, 2].some(a =>
+			Math.min(c.from[a], c.to[a]) - (c.inflate || 0) < -16 - 1e-9
+			|| Math.max(c.from[a], c.to[a]) + (c.inflate || 0) > 32 + 1e-9)).length;
+		if (outside) bad.push(`${outside} cubes outside the −16…32 box`);
+		if (created.animations.length) bad.push('a Java model got animations');
+		verdict('Java: a texture of its own, UV in the project\'s 16×16, inside the box', bad);
+	}
+
+	// An empty project takes the model's UV size, as a new one would.
+	{
+		open({ format: 'geckolib_model', uv: [16, 16], cubes: 0 });
+		formOverride = { add_to_open: true };
+		failed = await runImport('added to an empty GeckoLib project') || failed;
+		await settle();
+		const bad = [];
+		if (size() !== atlasPNG.join('×')) bad.push(`UV size ${size()}, not ${atlasPNG.join('×')}`);
+		if (created.textures.length !== 1) bad.push(`${created.textures.length} textures made`);
+		const uvBad = uvCheck(lib.texturePlan('fresh', null, atlasPNG));
+		if (uvBad) bad.push(uvBad);
+		verdict('Empty project: the model\'s own UV size', bad);
+	}
+
+	// A layered texture would be flattened by the redraw: the import stops first.
+	{
+		open({ format: 'geckolib_model', uv: [64, 64], texture: { layers_enabled: true } });
+		formOverride = { add_to_open: true };
+		created.cubes.length = 0;
+		reportShown = null;
+		importAction.click();
+		await new Promise(r => setTimeout(r, 300));
+		const bad = [];
+		if (created.cubes.length) bad.push(`${created.cubes.length} cubes were made`);
+		if (undoLog.length) bad.push('an undo step was opened');
+		if (size() !== '64×64' || openProject.textures[0].url) bad.push('the project was changed');
+		if (!/layers/.test(reportShown || '')) bad.push('the message does not say why');
+		verdict('Layered texture: stops before touching the project', bad);
+	}
+
+	// A project the import cannot build into gets no such offer.
+	{
+		open({ format: 'skin', uv: [64, 64], texture: {} });
+		formOverride = {};
+		delete formsShown[DIALOG];
+		importAction.click();
+		await new Promise(r => setTimeout(r, 300));
+		verdict('A skin project: not offered', (formsShown[DIALOG] || {}).add_to_open ? ['the dialog offers it'] : []);
+	}
+
+	openProject.groups = [];
+	openProject.textures = [];
+	openProject.elements = [];
+	openProject.animations = [];
+	Group.first_selected = null;
+	sandbox.Project = savedProject;
+	sandbox.Format = savedFormat;
+	formOverride = {};
+}
+
 // --- export to CPM: the same path, but saving a .cpmproject at the end.
 // Catches the same as the rest of the smoke test: access to fields that do not exist,
 // typos in names, forgotten Blockbench stubs. Geometric correctness
@@ -882,6 +1263,11 @@ if (!cpmAction) {
 	try {
 		cpmAction.click();
 		await new Promise(r => setTimeout(r, 500));
+		// The CPM export always builds a project of its own, even with one open.
+		if ((formsShown.gltf_to_minecraft_import_dialog || {}).add_to_open) {
+			failed = true;
+			console.log('❌ the CPM export offers adding to the open project');
+		}
 		// The bones asked about start at the top of the tidied tree. They used to
 		// start at the file's own top — the export wrapper, or a pass-through node
 		// such as this model's node_141 — which nobody can map to a body part.
@@ -943,6 +1329,37 @@ if (!cpmAction) {
 		}
 	}
 }
+
+// --- export to CPM with a rebuilt part: its plates are cubes like any other,
+// and the skin has to be drawn with their sheets, or they arrive clear.
+scenario = 'rounded';
+zipWritten = null;
+console.log('');
+console.log('--- export to CPM, with a part rebuilt from plates');
+{
+	const cpmAction = sandboxActions.find(a => a.id.endsWith('_cpm'));
+	const canvasesBefore = canvasLog.length;
+	cpmAction.click();
+	for (let i = 0; i < 100 && !zipWritten; i++) await new Promise(r => setTimeout(r, 100));
+	const bad = [];
+	if (!zipWritten || !zipWritten['config.json']) bad.push('no .cpmproject was assembled');
+	else {
+		const cfg = JSON.parse(zipWritten['config.json']);
+		let flat = 0;
+		const count = l => (l || []).forEach(e => {
+			if (e.size && [e.size.x, e.size.y, e.size.z].filter(v => Math.abs(v) < 1e-9).length === 1) flat++;
+			count(e.children);
+		});
+		cfg.elements.forEach(r => count(r.children));
+		if (flat < 14) bad.push(`${flat} flat elements, fewer than the prism's 14 plates`);
+		if (!zipWritten['skin.png']) bad.push('no skin.png');
+	}
+	const skinCanvas = canvasLog.slice(canvasesBefore).some(c => c.puts > 0);
+	if (!skinCanvas) bad.push('the skin was drawn without the baked sheets');
+	if (bad.length) { failed = true; console.log('❌ ' + bad.join('; ')); }
+	else console.log('The prism\'s plates went into the CPM project, and the skin was drawn with their sheets: OK');
+}
+scenario = 'png';
 
 // Without the GeckoLib format, choosing GeckoLib stops the import and names the
 // plugin to install. GeckoLib Animation Utils stops at Blockbench 5.0 and GeckoLib

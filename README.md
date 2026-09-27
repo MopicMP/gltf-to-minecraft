@@ -18,14 +18,21 @@ does that conversion, and everything around it.
 - **Import a ZIP or a folder** with a glTF model and textures, and get a finished
   project in the format you pick: GeckoLib, Bedrock Entity, Generic Model or a
   still Java block/item model. Textures may be PNG, JPEG, GIF or WebP.
+- **Add to the open project** instead of making a new one: a sword into the
+  selected hand, a helmet onto a head. One undo takes it all back.
 - **Browse Sketchfab** inside Blockbench, through the official Data API. Author
   and licence are shown on every card; only models the author allowed to be
   downloaded are listed, and by default only those made in Blockbench. The cards
-  show triangle and animation counts, and a filter keeps only animated models.
+  show triangle, animation and like counts, a filter keeps only animated models,
+  results can be ordered by likes, views or date, and any model can be turned
+  around in 3D before it is downloaded.
 - **Several textures** are packed into one atlas, because GeckoLib and Bedrock
   want one.
 - **Merged meshes** are split back into separate cubes automatically — many
   exporters emit 708 triangles where the model really has 59 boxes.
+- **Rounded and bevelled parts** are rebuilt from thin plates that follow their
+  surface, each cut to its outline by a baked texture — the way curves are built
+  by hand in Blockbench. *Best quality* also lays strips along sharp slanted edges.
 - **Animations** are carried over, both rotation and position channels.
 - **Coplanar faces** are separated through the `Inflate` field, so the model does
   not flicker (z-fighting) while coordinates stay clean.
@@ -60,10 +67,14 @@ Details: [How it works — Customizable Player Models](docs/how-it-works.md#6-cu
 
 ## What it cannot do
 
-Wedges, bevels and rounded shapes do not exist in Minecraft. Such objects are
-replaced with their bounding box, with the texture laid out per face. The import
-report states exactly which share of the model was approximated; at 30% or more
-it says plainly that the model is a poor fit.
+Wedges, bevels and rounded shapes do not exist in Minecraft. Such parts are
+rebuilt from thin turned plates that follow their surface, each cut to its outline
+by a baked texture, so wherever the model is used it needs cutout transparency, as
+the report says. Up close their slanted edges show fine steps; *Best quality*
+straightens them with strips along sharp edges, at 1.5 to 2 times the cubes. A
+model made mostly of such parts gets many times more cubes than it has objects.
+The advanced settings can instead replace each with its bounding box, skip them,
+or cancel the import. Details: [How it works — Parts that are not boxes](docs/how-it-works.md#9-parts-that-are-not-boxes).
 
 Coordinates are cleaned of floating-point noise (`4.99998` becomes `5`), but a
 model that was not built on a 0.25 px grid keeps its exact numbers. Snapping such
@@ -110,6 +121,30 @@ preview looked at: all 24 looked at of the 84 at exactly 2:3 were cubes, and
 most of the 21 below 0.6 were cars with round wheels, bevelled houses and smooth
 figures. In between there is no icon, because there it is mixed.
 
+**Order.** The list next to the boxes puts the results in order: *Relevance*
+(Sketchfab's own), *Most liked*, *Most viewed* or *Newest*. The choice is
+remembered. Each order was checked on the live API, both pages of it: the second
+carries on where the first stopped, with no model twice. There is no order by
+downloads — the results carry no download count, and the API takes
+`sort_by=-downloadCount` without complaint and returns the newest models instead,
+so offering it would have been a quiet lie.
+
+**Look before downloading.** The 3D button on a card's picture opens
+Sketchfab's own viewer inside the search window: the model can be turned, and
+its animations played, before anything is downloaded. *Import* beside it
+downloads it as a click on the card does, *Open on Sketchfab* opens its page in
+the browser, and *Results* goes back to the list. A click on the card itself
+still imports at once.
+
+**The author's original, when it is Blockbench's.** Sketchfab keeps two archives
+of a model: its own conversion to glTF and the file the author uploaded. A model
+uploaded straight from Blockbench has Blockbench's own glTF as its original, and
+the conversion can spoil it — it was seen dropping a texture's transparency, so a
+fifth of a model's faces came out black, and it wraps every model in extra
+nodes. So for such models the original is downloaded; for any other, or when the
+original holds no glTF, the conversion is, as before. The report says when the
+original was taken.
+
 **Import:** File → Import → *Import glTF Model*, or the tile on the start
 screen.
 
@@ -133,6 +168,28 @@ it is larger than the box. Which Minecraft can show it depends on its cube
 rotations: one axis in 22.5° steps works everywhere, any angle on one axis needs
 1.21.6, and cubes turned on several axes or past 45° need 1.21.11. The report
 says which one the model needs, and the project's Java format is raised to it.
+
+**Adding to the open project.** With a project open in one of these formats, the
+dialog offers *Add to the open project*. The model then takes that project's
+format and arrives as one folder: into the selected folder, standing on its
+pivot, so a sword put into a hand turns with it; to the top level when nothing
+is selected. Its folders never take a name the project already has, and its
+animations are left out unless *Add its animations too* is ticked, in which case
+they carry the model's name in front of theirs.
+
+The texture joins the project's the way the format allows:
+
+| Format | The model's texture |
+|---|---|
+| GeckoLib, Bedrock Entity | drawn beside the project texture, which grows to hold both |
+| Generic Model | added as a texture of its own, with its own UV size |
+| Java Block/Item | added as a texture of its own, its UV fitted to the project's UV size |
+
+The first two allow one texture per model. UV count pixels, so the old texture
+stays in its corner and every UV already made keeps reading the same pixels; a
+texture painted at twice its UV size gets the model's drawn twice as large too. A
+texture with layers is refused, since redrawing it would merge them. The whole
+import is one undo step, closed only once the texture is drawn.
 
 **A folder works in place of an archive.** In the same picker you can select the
 files of an already unpacked folder — the model, its `.bin` and the textures —
@@ -179,8 +236,11 @@ node tools/verify-cpm.mjs                            # .cpmproject: structure, l
 node tools/verify-java-fit.mjs                       # Java models: the box and the Minecraft version
 node tools/verify-outliner.mjs                       # the outliner: folders dropped, none animated lost
 node tools/verify-per-face-textures.mjs              # a texture per face, and faces with none
+node tools/verify-rounded.mjs                        # parts that are not boxes: plates, strips, texel, culling
+node tools/verify-quirks.mjs                         # file quirks: hair-thin panels, specular-glossiness, outline shells
+node tools/verify-add-to-project.mjs                 # adding to an open project: texture placement, names
 node tools/verify-strips.mjs                         # triangle strips and fans, on real models
-node tools/verify-search-filter.mjs --live           # Sketchfab filters, against the live API
+node tools/verify-search-filter.mjs --live           # Sketchfab filters and orders, against the live API
 node tools/smoke-plugin.mjs                          # the whole import path
 node tools/survey-models.mjs                         # what the import makes of every model in test/model
 ```
@@ -190,7 +250,9 @@ node tools/survey-models.mjs                         # what the import makes of 
 an unreadable image, an image nobody refers to, objects naming no image, a
 texture without the alpha its material asks for, and the same model as loose
 folder files. Then it builds the same model into Bedrock, Generic and Java, and
-checks the Java one against the box and its format version. It also checks that
+checks the Java one against the box and its format version. It adds the model to
+open projects of every format — into a folder, beside a texture painted at twice
+its UV size, into an empty one — and refuses a layered texture. It also checks that
 every entry sits in File > Import, and what happens without GeckoLib on
 Blockbench 4 and 5. The CPM export runs after them, down the same path but saving
 a `.cpmproject`. It catches what
@@ -209,4 +271,5 @@ calls to functions that do not exist.
 MIT, see [LICENSE](LICENSE).
 
 Imported models keep their own licence. Most Sketchfab models require attribution,
-so the import report always prints the author and the licence from the archive.
+so the import report always prints the author and the licence from the archive —
+or, for the author's original, which carries none, from the model's page.

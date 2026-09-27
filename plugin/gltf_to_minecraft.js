@@ -52,13 +52,24 @@ function detectBox(pts) {
 	return null;
 }
 
-/** Full box: look for three mutually orthogonal edges starting from p0. */
+/**
+ * Full box: look for three mutually orthogonal edges starting from p0.
+ *
+ * Of the edge triples that pass, the one whose corners land closest wins, not
+ * the first found. On a panel a thousandth of a pixel thick the corner across
+ * the thickness sits within the tolerance of the true neighbour, so an edge run
+ * to it passes too — slanted by the thickness over the length. Taken as an axis
+ * it tilts the whole box a hair, the big faces no longer lie on its sides, and
+ * the panel comes out with nothing on its two faces that show: an awning and the
+ * snow on it vanished from a scene this way.
+ */
 function detectBox8(pts) {
 	const p0 = pts[0];
 	const rest = pts.slice(1);
 	const span = Math.max(...rest.map(p => dist(p, p0)));
 	if (!span) return null;
 	const tol = span * TOL_REL;
+	let best = null, bestErr = Infinity;
 
 	for (let i = 0; i < rest.length; i++) {
 		for (let j = i + 1; j < rest.length; j++) {
@@ -81,11 +92,14 @@ function detectBox8(pts) {
 				}
 				if (!sameSet(pts, corners, tol)) continue;
 
-				return refineBox(pts, e);
+				// how far the worst corner lands; an exact triple gives float noise
+				let err = 0;
+				for (const p of pts) err = Math.max(err, Math.min(...corners.map(q => dist(p, q))));
+				if (err < bestErr) { bestErr = err; best = e; }
 			}
 		}
 	}
-	return null;
+	return best ? refineBox(pts, best) : null;
 }
 
 /**
@@ -539,6 +553,72 @@ function splitComponents(faces) {
 		groups.get(root).push(f);
 	});
 	return [...groups.values()];
+}
+
+/**
+ * Outline shells drawn by the inverted-hull trick, found among an object's faces.
+ *
+ * A toon outline is a copy of a part, a little larger, turned inside out and on a
+ * one-sided dark material. A viewer that culls back faces draws only its far
+ * side, which peeks out around the part as a rim. Blockbench and Minecraft draw
+ * cubes from both sides, so the same shell arrives as a dark casing over the
+ * part: on a model with a dozen of them nearly every part came out dark. A rim
+ * cannot be kept that way, so the shell is left out.
+ *
+ * A shell is a connected piece whose faces are all one-sided, closed, and wound
+ * inward: its signed volume is negative, read the other way round under a
+ * mirroring transform, where glTF itself turns the winding. Up to one edge in
+ * twenty may go unpaired, since one such shell carried doubled triangles. Across
+ * every model at hand nothing else fits: inside-out closed parts on two-sided
+ * materials exist, and there the winding means nothing.
+ *
+ * Returns the faces to leave out and how many shells they make.
+ */
+function insideOutShells(faces, oneSided, mirrored) {
+	const out = new Set();
+	let shells = 0;
+	if (!oneSided.size) return { faces: out, shells };
+	for (const piece of splitComponents(faces)) {
+		if (piece.length < 4 || !piece.every(f => oneSided.has(f))) continue;
+		const v = enclosedVolume(piece);
+		if (v && (mirrored ? -v : v) < 0) {
+			shells++;
+			for (const f of piece) out.add(f);
+		}
+	}
+	return { faces: out, shells };
+}
+
+/**
+ * Signed volume a closed surface encloses: positive when wound outward, 0 when
+ * the surface is open. Measured from the centroid, so a small hole shifts it
+ * little.
+ */
+function enclosedVolume(faces) {
+	const key = p => Math.round(p[0] * 1000) + ',' + Math.round(p[1] * 1000) + ',' + Math.round(p[2] * 1000);
+	const edges = new Map();
+	const c = [0, 0, 0];
+	let n = 0;
+	for (const f of faces) for (const p of f.positions) { c[0] += p[0]; c[1] += p[1]; c[2] += p[2]; n++; }
+	c[0] /= n; c[1] /= n; c[2] /= n;
+	let volume = 0;
+	for (const f of faces) {
+		const ks = f.positions.map(key);
+		if (ks[0] === ks[1] || ks[1] === ks[2] || ks[0] === ks[2]) continue;
+		for (let i = 0; i < 3; i++) {
+			const e = ks[i] + '>' + ks[(i + 1) % 3];
+			edges.set(e, (edges.get(e) || 0) + 1);
+		}
+		const [a, b, d] = f.positions.map(p => [p[0] - c[0], p[1] - c[1], p[2] - c[2]]);
+		volume += (a[0] * (b[1] * d[2] - b[2] * d[1]) - a[1] * (b[0] * d[2] - b[2] * d[0])
+			+ a[2] * (b[0] * d[1] - b[1] * d[0])) / 6;
+	}
+	let unpaired = 0;
+	for (const [e, count] of edges) {
+		const [from, to] = e.split('>');
+		if (count !== 1 || edges.get(to + '>' + from) !== 1) unpaired++;
+	}
+	return edges.size && unpaired <= edges.size / 20 ? volume : 0;
 }
 
 // ------------------------------------------------------------------ core
@@ -1214,8 +1294,11 @@ function parseGLTFFiles(files, opts) {
 	};
 	for (const m of gltf.materials || []) {
 		const pbr = m.pbrMetallicRoughness || {};
-		if (pbr.baseColorTexture) setRole(pbr.baseColorTexture.index, 'color');
+		const colour = colourTextureOf(m);
+		if (colour) setRole(colour.index, 'color');
 		if (pbr.metallicRoughnessTexture) setRole(pbr.metallicRoughnessTexture.index, 'aux');
+		const sg = m.extensions && m.extensions.KHR_materials_pbrSpecularGlossiness;
+		if (sg && sg.specularGlossinessTexture) setRole(sg.specularGlossinessTexture.index, 'aux');
 		if (m.normalTexture) setRole(m.normalTexture.index, 'aux');
 		if (m.emissiveTexture) setRole(m.emissiveTexture.index, 'aux');
 		if (m.occlusionTexture) setRole(m.occlusionTexture.index, 'aux');
@@ -1229,7 +1312,7 @@ function parseGLTFFiles(files, opts) {
 	});
 	// A fully transparent placeholder: Blockbench's stand-in for "no texture".
 	for (const img of images) img.blank = !!img.bytes && isBlankImage(img.bytes);
-	let blankTriangles = 0, blankObjects = 0;
+	let blankTriangles = 0, blankObjects = 0, outlineShells = 0;
 
 	const objects = [];
 	// The node hierarchy is needed twice: as GeckoLib bones and as animation
@@ -1315,15 +1398,15 @@ function parseGLTFFiles(files, opts) {
 
 		if (node.mesh !== undefined) {
 			const mesh = gltf.meshes[node.mesh];
-			const faces = [];
+			let faces = [];
+			// faces on a one-sided material, where the winding says which side shows
+			const oneSided = new Set();
 			// Which image each primitive uses: material -> texture -> image. Per
 			// primitive, not per object: Blockbench exports every face of a cube as
 			// a primitive of its own, and a face with no texture points at a
 			// transparent placeholder. The image used to be taken from the first
 			// primitive and applied to all six, so a cube whose first face had no
 			// texture came out invisible — reported on a shark whose fin vanished.
-			const trianglesPerImage = new Map();
-			let blankHere = 0;
 			for (const prim of mesh.primitives || []) {
 				if (prim.mode !== undefined && !TRIANGULATE[prim.mode]) {
 					warnings.push(`${node.name || mesh.name}: primitive mode ${prim.mode} skipped (points and lines are not geometry)`);
@@ -1331,10 +1414,11 @@ function parseGLTFFiles(files, opts) {
 				}
 				const posIdx = prim.attributes && prim.attributes.POSITION;
 				if (posIdx === undefined) continue;
-				let imageIndex = -1;
+				let imageIndex = -1, culled = false;
 				if (prim.material !== undefined) {
 					const mat = (gltf.materials || [])[prim.material];
-					const texRef = mat && mat.pbrMetallicRoughness && mat.pbrMetallicRoughness.baseColorTexture;
+					culled = !!mat && !mat.doubleSided;
+					const texRef = mat && colourTextureOf(mat);
 					const tex = texRef && (gltf.textures || [])[texRef.index];
 					if (tex && tex.source !== undefined) imageIndex = tex.source;
 				}
@@ -1372,13 +1456,31 @@ function parseGLTFFiles(files, opts) {
 					: readAccessor(gltf, buffers, prim.indices).map(a => a[0]);
 
 				for (const tri of TRIANGULATE[prim.mode === undefined ? 4 : prim.mode](idx)) {
-					faces.push({
+					const face = {
 						positions: tri.map(k => pos[k]),
 						uvs: tri.map(k => uv ? uv[k] : null),
-					});
-					if (blank) blankHere++;
-					else trianglesPerImage.set(imageIndex, (trianglesPerImage.get(imageIndex) || 0) + 1);
+						// the picture it reads, by glTF index; -1 for none
+						image: imageIndex,
+					};
+					faces.push(face);
+					if (culled) oneSided.add(face);
 				}
+			}
+			// Outline shells are left out (see insideOutShells). A mirroring
+			// transform turns the winding, and glTF reads it the other way there.
+			const w = world;
+			const mirrored = w[0] * (w[5] * w[10] - w[6] * w[9]) - w[4] * (w[1] * w[10] - w[2] * w[9])
+				+ w[8] * (w[1] * w[6] - w[2] * w[5]) < 0;
+			const outline = insideOutShells(faces, oneSided, mirrored);
+			if (outline.shells) {
+				outlineShells += outline.shells;
+				faces = faces.filter(f => !outline.faces.has(f));
+			}
+			const trianglesPerImage = new Map();
+			let blankHere = 0;
+			for (const f of faces) {
+				if (f.image >= 0 && images[f.image] && images[f.image].blank) blankHere++;
+				else trianglesPerImage.set(f.image, (trianglesPerImage.get(f.image) || 0) + 1);
 			}
 			blankTriangles += blankHere;
 			// Nothing but placeholder faces: an object nobody could ever see. Sketchfab's
@@ -1420,8 +1522,40 @@ function parseGLTFFiles(files, opts) {
 		objects, images, warnings, hierarchy, wantsAlpha,
 		// faces on a transparent placeholder, kept hidden, and objects made of nothing else
 		blank: { triangles: blankTriangles, objects: blankObjects },
+		// inside-out outline shells left out
+		outlineShells,
 		animations: parseAnimations(gltf, buffers, warnings),
 	};
+}
+
+/**
+ * The texture that gives a material its colour. In glTF's own workflow that is
+ * baseColorTexture; a file written in the specular-glossiness one keeps it as
+ * diffuseTexture inside that extension instead. Read only there, such a file
+ * looked textureless: every part fell back to the first picture, and on a scene
+ * of a building with people in it the people wore pieces of the walls.
+ */
+function colourTextureOf(mat) {
+	const pbr = mat && mat.pbrMetallicRoughness;
+	if (pbr && pbr.baseColorTexture) return pbr.baseColorTexture;
+	const sg = mat && mat.extensions && mat.extensions.KHR_materials_pbrSpecularGlossiness;
+	return (sg && sg.diffuseTexture) || null;
+}
+
+/**
+ * Moves every face's UV from its picture's own 0..1 into the atlas: `rects` by
+ * glTF image index, `fallback` for a face that names no picture, and with
+ * neither the UV size. The same as the parser's `uvRects`, done afterwards: the
+ * atlas can only be laid out once the rebuild of the parts that are not boxes
+ * has said what it adds to it, and the rebuild reads the pictures through the
+ * UV as they were.
+ */
+function mapFaceUVs(objects, rects, fallback, uvSize) {
+	for (const o of objects) for (const f of o.faces) {
+		if (!f.uvs) continue;
+		const r = f.image >= 0 ? rects[f.image] : fallback;
+		f.uvs = f.uvs.map(t => t && (r ? [t[0] * r.w + r.x, t[1] * r.h + r.y] : [t[0] * uvSize[0], t[1] * uvSize[1]]));
+	}
 }
 
 /**
@@ -1725,7 +1859,7 @@ const SKETCHFAB_API = 'https://api.sketchfab.com/v3';
  * and all 24 filtered ones do — on the second page as well, because the `next`
  * link Sketchfab returns keeps the parameter.
  */
-function sketchfabSearchURL(query, blockbenchOnly, animatedOnly) {
+function sketchfabSearchURL(query, blockbenchOnly, animatedOnly, sort) {
 	const params = [
 		'type=models',
 		'downloadable=true',
@@ -1737,7 +1871,156 @@ function sketchfabSearchURL(query, blockbenchOnly, animatedOnly) {
 	// Measured on the live API: with it 24 of 24 results carry an animation, without
 	// it 3 to 13 of 24 did, and the next-page link keeps the parameter.
 	if (animatedOnly) params.push('animated=true');
+	if (sort && SKETCHFAB_SORTS.some(s => s.id === sort)) params.push('sort_by=' + sort);
 	return SKETCHFAB_API + '/search?' + params.join('&');
+}
+
+/**
+ * The orders the search can be put in. Measured on the live API: each of these
+ * comes back ordered by its field, and the next-page link keeps it, so the
+ * second page carries on where the first stopped. Without one, Sketchfab orders
+ * by relevance.
+ *
+ * There is no order by downloads: the results carry no download count, and
+ * `sort_by=-downloadCount` — like any value the API does not know — is taken
+ * without complaint and returns the newest models instead. So only values from
+ * this list are ever sent.
+ */
+const SKETCHFAB_SORTS = [
+	{ id: '', label: 'Relevance' },
+	{ id: '-likeCount', label: 'Most liked' },
+	{ id: '-viewCount', label: 'Most viewed' },
+	{ id: '-publishedAt', label: 'Newest' },
+];
+
+/**
+ * Sketchfab's own 3D viewer for a model, to embed. Built from the uid rather than
+ * taken from the results, so nothing but a model id ever lands in the frame's
+ * address; `dnt` asks the viewer not to track.
+ */
+function sketchfabEmbedURL(uid) {
+	return /^[0-9a-f]{32}$/i.test(String(uid))
+		? `https://sketchfab.com/models/${uid}/embed?autostart=1&dnt=1&ui_theme=dark`
+		: null;
+}
+
+/** The model's page on Sketchfab: the one the results give, if it is Sketchfab's. */
+function sketchfabPageURL(model) {
+	const given = model && model.viewerUrl;
+	if (typeof given === 'string' && /^https:\/\/sketchfab\.com\//.test(given)) return given;
+	return model && /^[0-9a-f]{32}$/i.test(String(model.uid)) ? `https://sketchfab.com/3d-models/${model.uid}` : null;
+}
+
+/**
+ * Which of a model's archives to fetch, in the order to try them.
+ *
+ * Sketchfab keeps two: its own conversion to glTF, and the file the author
+ * uploaded. The conversion is the safe choice, since an original may be a .blend
+ * or an .fbx. But a model uploaded straight from Blockbench has Blockbench's own
+ * glTF for an original, and the conversion can spoil it: it was seen dropping a
+ * texture's transparency together with the material's alphaMode, so a fifth of
+ * the faces came out black, rewriting the materials into specular-glossiness,
+ * and wrapping the model in hundreds of numbered nodes. The originals of the same
+ * models kept the transparency, the author's folders and every cube.
+ *
+ * Where a model came from is in its details (`source`); search results leave it
+ * out. Without the details the conversion is taken, as before.
+ */
+function sketchfabArchives(links, details) {
+	const list = [];
+	if (details && details.source === 'blockbench' && links.source && links.source.url) {
+		list.push({ url: links.source.url, original: true });
+	}
+	const converted = links.gltf || links.glb;
+	if (converted && converted.url) list.push({ url: converted.url, original: false });
+	return list;
+}
+
+/**
+ * The credit Sketchfab writes into its conversion as license.txt, made from the
+ * model's details: the author's original comes without one, and attribution must
+ * not be lost on the way.
+ */
+function sketchfabCredit(details) {
+	const user = details.user || {}, lic = details.license || {};
+	const author = (user.displayName || user.username || '?') + (user.profileUrl ? ` (${user.profileUrl})` : '');
+	const licence = (lic.fullName || lic.label || 'not stated') + (lic.url ? ` (${lic.url})` : '');
+	return [
+		'Model Information:',
+		`* title:\t${details.name || '?'}`,
+		`* source:\t${details.viewerUrl || '?'}`,
+		`* author:\t${author}`,
+		'',
+		'Model License:',
+		`* license type:\t${licence}`,
+		...(lic.requirements ? [`* requirements:\t${lic.requirements}`] : []),
+		'',
+		'If you use this 3D model in your project be sure to copy paste this credit wherever you share it:',
+		`This work is based on "${details.name || '?'}" (${details.viewerUrl || '?'}) by ${author} licensed under ${licence}`,
+	].join('\n');
+}
+
+/**
+ * Downloads a model: the unpacked files, and whether they are the author's
+ * original. Which archive is tried first is sketchfabArchives' call; an
+ * original that fails to come or holds no glTF gives way to the conversion.
+ *
+ * The archive links are temporary, so they are fetched at once.
+ */
+async function sketchfabDownload(uid, token, onProgress) {
+	if (!token) throw new Error('no API token set');
+	const say = text => onProgress && onProgress(text);
+
+	say('requesting link…');
+	// The details need no token, and are asked for alongside the links.
+	const asked = fetch(SKETCHFAB_API + '/models/' + uid)
+		.then(r => r.ok ? r.json() : null)
+		.catch(() => null);
+	const r = await fetch(SKETCHFAB_API + '/models/' + uid + '/download', {
+		headers: { Authorization: 'Token ' + token },
+	});
+	if (r.status === 401) throw new Error('token rejected (401)');
+	if (r.status === 403) throw new Error('no permission to download this model (403)');
+	if (!r.ok) throw new Error('HTTP ' + r.status);
+	const links = await r.json();
+	const details = await asked;
+	const archives = sketchfabArchives(links, details);
+	if (!archives.length) throw new Error('the response has no glTF link');
+
+	let failure = null;
+	for (const archive of archives) {
+		try {
+			say(archive.original ? 'downloading the author\'s original…' : 'downloading archive…');
+			const entries = await sketchfabUnpack(archive.url, say);
+			if (!archive.original) return { entries, original: false };
+			if (Object.keys(entries).some(n => /\.(gltf|glb)$/i.test(n))) {
+				if (!Object.keys(entries).some(n => /license[.]txt$/i.test(n))) {
+					entries['license.txt'] = new TextEncoder().encode(sketchfabCredit(details));
+				}
+				return { entries, original: true };
+			}
+		} catch (e) {
+			failure = e;
+		}
+	}
+	throw failure || new Error('the author\'s original holds no glTF, and there is no conversion');
+}
+
+/** Fetches an archive and unpacks it: path in the archive -> bytes. */
+async function sketchfabUnpack(url, say) {
+	const r = await fetch(url);
+	if (!r.ok) throw new Error('archive returned HTTP ' + r.status);
+	const buf = await r.arrayBuffer();
+	say('unpacking…');
+	const zip = await JSZip.loadAsync(buf);
+	const entries = {};
+	const tasks = [];
+	zip.forEach((relPath, entry) => {
+		if (entry.dir) return;
+		tasks.push(entry.async('uint8array').then(data => { entries[relPath] = data; }));
+	});
+	await Promise.all(tasks);
+	return entries;
 }
 
 // ------------------------------------------- CPM (.cpmproject) construction
@@ -2735,10 +3018,11 @@ const GENERIC_NODE = /^(_?gltfnode_?\d*|object_?\d*|node_?\d*|mesh_?\d*|_?\d+)$/
  * number it is the exporter's, and one is stripped; a folder name that then
  * repeats gets a number back, because GeckoLib and Bedrock bones must differ.
  *
- * `cubeNodes` lists the node of every cube; returns the kept folders with their
- * parents and names, and for a cube, its folder and name.
+ * `cubeNodes` lists the node of every cube, and `taken` the names a folder may
+ * not have; returns the kept folders with their parents and names, and for a
+ * cube, its folder and name.
  */
-function tidyHierarchy(hierarchy, cubeNodes, animated) {
+function tidyHierarchy(hierarchy, cubeNodes, animated, taken) {
 	const byIndex = new Map(hierarchy.map(h => [h.index, h]));
 	const count = new Map(hierarchy.map(h => [h.index, 0]));
 	for (const h of hierarchy) if (byIndex.has(h.parent)) count.set(h.parent, count.get(h.parent) + 1);
@@ -2772,13 +3056,12 @@ function tidyHierarchy(hierarchy, cubeNodes, animated) {
 
 	const parent = new Map();
 	const name = new Map();
-	const used = new Set();
+	// names already in the project the model is added to count as taken
+	const used = new Set(taken || []);
 	for (const h of hierarchy) {
 		if (removed.has(h.index)) continue;
 		parent.set(h.index, liveParent(h.index));
-		const base = clean(h.name);
-		let unique = base;
-		for (let k = 2; used.has(unique); k++) unique = `${base}_${k}`;
+		const unique = uniqueName(clean(h.name), used);
 		used.add(unique);
 		name.set(h.index, unique);
 	}
@@ -2824,6 +3107,1126 @@ function cubeHint(faceCount, vertexCount) {
 	return v / f < 0.6 ? 'shapes' : null;
 }
 
+// -------------------------------------------- adding to the open project
+
+/** `base`, or `base_2`, `base_3`… — the first one not in `used`. */
+function uniqueName(base, used) {
+	let name = base;
+	for (let k = 2; used.has(name); k++) name = `${base}_${k}`;
+	return name;
+}
+
+/** A model's file name as a folder or animation name: `Iron Sword (1).zip` → `iron_sword_1`. */
+function nameSlug(fileName) {
+	return String(fileName || '').replace(/\.[^.]*$/, '').toLowerCase()
+		.replace(/[^a-z0-9_]+/g, '_').replace(/^_+|_+$/g, '') || 'model';
+}
+
+/**
+ * Where the new texture goes on a project texture it has to share: beside it or
+ * under it, whichever leaves the smaller sheet, and the squarer one on a tie.
+ * The old texture stays in the corner, so every UV already made still reads the
+ * same pixels. Sizes are in the project's UV units.
+ */
+function placeBeside(base, add) {
+	const right = { x: base[0], y: 0, width: base[0] + add[0], height: Math.max(base[1], add[1]) };
+	const below = { x: 0, y: base[1], width: Math.max(base[0], add[0]), height: base[1] + add[1] };
+	const area = r => r.width * r.height;
+	const long = r => Math.max(r.width, r.height) / Math.min(r.width, r.height);
+	if (area(right) !== area(below)) return area(right) < area(below) ? right : below;
+	return long(right) <= long(below) ? right : below;
+}
+
+/**
+ * How a model's atlas joins a project and where its UV go there. `kind` is:
+ *   fresh   nothing is in the project yet, or it is new: the project's UV size
+ *           becomes the atlas's
+ *   own     each texture has a UV size of its own (Generic): the atlas keeps its
+ *           size and is added beside the textures already there
+ *   shared every texture shares the project's UV size (Java): the atlas becomes a
+ *           texture of its own and its UV are squeezed into that size, as
+ *           Minecraft stretches every texture over it anyway
+ *   beside  one texture per model (GeckoLib, Bedrock): the atlas is drawn beside
+ *           the project's texture, which grows to hold both
+ * `project` and `atlas` are [width, height]. The result gives the UV size the
+ * parser scales to, where the atlas starts and how much it is scaled in UV
+ * units, and the project's new UV size, or null to leave it.
+ */
+function texturePlan(kind, project, atlas) {
+	if (kind === 'shared') {
+		return { uvSize: project.slice(), offset: [0, 0], scale: [project[0] / atlas[0], project[1] / atlas[1]], projectSize: null };
+	}
+	if (kind === 'beside') {
+		const spot = placeBeside(project, atlas);
+		const size = [spot.width, spot.height];
+		return { uvSize: size, offset: [spot.x, spot.y], scale: [1, 1], projectSize: size };
+	}
+	return { uvSize: atlas.slice(), offset: [0, 0], scale: [1, 1], projectSize: kind === 'fresh' ? atlas.slice() : null };
+}
+
+/** An atlas rectangle moved to where the plan puts the atlas. */
+function placeRect(r, plan) {
+	return r && {
+		x: plan.offset[0] + r.x * plan.scale[0], y: plan.offset[1] + r.y * plan.scale[1],
+		w: r.w * plan.scale[0], h: r.h * plan.scale[1],
+	};
+}
+
+// ------------------------------------------------ rounded parts: the pieces
+
+/**
+ * Parts that are not boxes — bevels, wedges, anything rounded — used to become
+ * their bounding box, and their shape was gone. Here such a part is rebuilt the
+ * way its surface runs: each near-flat stretch of the surface becomes a flat
+ * cube lying in its plane, and the stretch's outline is cut out of that cube by
+ * the transparency of a texture baked for it. A cube can only be a rectangle;
+ * the texture is what lets its outline run at a slant.
+ *
+ * Measured against the source, rendered from twelve sides: on the test models
+ * plates got 3 to 30 times fewer pixels wrong than boxes did, and in a blind
+ * comparison they won on every model. What they cost is cubes and texture —
+ * several times more of both.
+ *
+ * Two ways, picked in the import dialog:
+ *  - fast: plates alone. A slanted edge is drawn by whole texels, and at 1/8 px
+ *    those show as fine steps up close;
+ *  - best: a thin strip also lies along every slanted edge where the surface
+ *    turns sharply or ends. The strip is turned to run along the edge, so the
+ *    edge falls on the strip's own texel border and comes out straight. It takes
+ *    1.5 to 2 times the cubes.
+ *
+ * All distances are model pixels.
+ */
+const ROUND = {
+	// A part that one box follows this closely, both ways, stays one box: most
+	// deformed cubes do, and a box is one cube where plates would be six.
+	FIT_TOL: 0.1,
+	// Triangles join a region while its corners stay this close to its plane and
+	// each turns less than this from it. Bolder merging was measured to cost
+	// quality; stricter merging leaves the plates too small to draw an edge.
+	REGION_EPS: 0.15,
+	REGION_ANGLE: 5,
+	// The texel of the baked sheets: the finest whose total fits the budget, a
+	// sheet of 2048². At 1 px the steps along a slanted edge are what one sees.
+	TEXELS: [0.125, 0.25, 0.5, 1],
+	TEXEL_BUDGET: 4e6,
+	// A texel shows while its centre lies this close to the outline, in texels:
+	// without it a thin sliver between texel centres would vanish.
+	DILATE: 0.35,
+	// Strips: their width in texels, the shortest edge worth one, and the turn of
+	// the surface across the edge below which the step is not seen.
+	STRIP_WIDTH: 1.5,
+	STRIP_MIN: 1,
+	CREASE: 30,
+	// Each strip lies this much further out than the one before it on its plate,
+	// so strips that cross at a corner do not flicker against each other.
+	LIFT: 0.006,
+	// A cube is kept when it covers this many pixels from at least one of the
+	// directions it is looked at from, the model drawn this many pixels across.
+	CULL_PIXELS: 4,
+	CULL_SCALE: 840,
+	// A texel read on a triangle's very edge is pulled this share towards its
+	// middle: the edge of a triangle is the edge of its UV island, and rounding
+	// there picks the neighbouring island's pixel.
+	UV_INSET: 0.01,
+};
+const ROUND_MODES = ['fast', 'best'];
+
+const pointKey = p => p[0].toFixed(4) + ',' + p[1].toFixed(4) + ',' + p[2].toFixed(4);
+const edgeKey = (a, b) => (a < b ? a + '|' + b : b + '|' + a);
+
+function uniquePoints(tris) {
+	const seen = new Set(), pts = [];
+	for (const t of tris) for (const q of t) {
+		const k = pointKey(q);
+		if (!seen.has(k)) { seen.add(k); pts.push(q); }
+	}
+	return pts;
+}
+
+/** 2D convex hull, monotone chain. */
+function hull2d(pts) {
+	const p = pts.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+	const cr = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+	const lo = [], hi = [];
+	for (const q of p) { while (lo.length >= 2 && cr(lo[lo.length - 2], lo[lo.length - 1], q) <= 0) lo.pop(); lo.push(q); }
+	for (const q of p.slice().reverse()) { while (hi.length >= 2 && cr(hi[hi.length - 2], hi[hi.length - 1], q) <= 0) hi.pop(); hi.push(q); }
+	return lo.slice(0, -1).concat(hi.slice(0, -1));
+}
+
+/** The box along given axes that holds the points: { c, axes, half }. */
+function boxAlong(axes, pts) {
+	const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+	for (const p of pts) for (let a = 0; a < 3; a++) {
+		const t = dot(p, axes[a]);
+		if (t < lo[a]) lo[a] = t;
+		if (t > hi[a]) hi[a] = t;
+	}
+	const mid = [0, 1, 2].map(a => (lo[a] + hi[a]) / 2);
+	return {
+		c: [0, 1, 2].map(i => axes[0][i] * mid[0] + axes[1][i] * mid[1] + axes[2][i] * mid[2]),
+		axes, half: [0, 1, 2].map(a => (hi[a] - lo[a]) / 2),
+	};
+}
+const boxVolume = b => 8 * b.half[0] * b.half[1] * b.half[2];
+
+/**
+ * The smallest box found among the directions the triangles face: for each
+ * normal, the box whose side lies along each edge of the points' hull in that plane.
+ */
+function minVolumeBox(pts, tris) {
+	const dirs = [];
+	for (const [a, b, c] of tris) {
+		const n = cross(sub(b, a), sub(c, a));
+		if (len(n) < 1e-9) continue;
+		const u = norm(n);
+		if (!dirs.some(d => Math.abs(dot(d, u)) > 0.9999)) dirs.push(u);
+	}
+	let best = boxAlong([[1, 0, 0], [0, 1, 0], [0, 0, 1]], pts);
+	for (const n of dirs) {
+		const t = norm(Math.abs(n[0]) < 0.9 ? cross(n, [1, 0, 0]) : cross(n, [0, 1, 0]));
+		const s = cross(n, t);
+		const h = hull2d(pts.map(p => [dot(p, t), dot(p, s)]));
+		for (let i = 0; i < h.length; i++) {
+			const q = h[(i + 1) % h.length];
+			const e = norm([q[0] - h[i][0], q[1] - h[i][1], 0]);
+			const ax1 = norm([t[0] * e[0] + s[0] * e[1], t[1] * e[0] + s[1] * e[1], t[2] * e[0] + s[2] * e[1]]);
+			const b = boxAlong([n, ax1, cross(n, ax1)], pts);
+			if (boxVolume(b) < boxVolume(best)) best = b;
+		}
+	}
+	return best;
+}
+
+/** The closest point of a triangle to a point, as barycentric weights (after Ericson). */
+function closestOnTriangle(pt, t) {
+	const [a, b, c] = t;
+	const ab = sub(b, a), ac = sub(c, a), ap = sub(pt, a);
+	const d1 = dot(ab, ap), d2 = dot(ac, ap);
+	if (d1 <= 0 && d2 <= 0) return [1, 0, 0];
+	const bp = sub(pt, b), d3 = dot(ab, bp), d4 = dot(ac, bp);
+	if (d3 >= 0 && d4 <= d3) return [0, 1, 0];
+	const vc = d1 * d4 - d3 * d2;
+	if (vc <= 0 && d1 >= 0 && d3 <= 0) { const v = d1 / (d1 - d3); return [1 - v, v, 0]; }
+	const cp = sub(pt, c), d5 = dot(ab, cp), d6 = dot(ac, cp);
+	if (d6 >= 0 && d5 <= d6) return [0, 0, 1];
+	const vb = d5 * d2 - d1 * d6;
+	if (vb <= 0 && d2 >= 0 && d6 <= 0) { const w = d2 / (d2 - d6); return [1 - w, 0, w]; }
+	const va = d3 * d6 - d5 * d4;
+	if (va <= 0 && (d4 - d3) >= 0 && (d5 - d6) >= 0) { const w = (d4 - d3) / ((d4 - d3) + (d5 - d6)); return [0, 1 - w, w]; }
+	const den = 1 / (va + vb + vc), v = vb * den, w = vc * den;
+	return [1 - v - w, v, w];
+}
+
+/** Where a ray meets a triangle: distance along it and barycentric weights, or null. */
+function rayTriangle(o, d, t) {
+	const e1 = sub(t[1], t[0]), e2 = sub(t[2], t[0]);
+	const h = cross(d, e2), det = dot(e1, h);
+	if (Math.abs(det) < 1e-12) return null;
+	const f = 1 / det, s = sub(o, t[0]), u = f * dot(s, h);
+	if (u < -1e-6 || u > 1 + 1e-6) return null;
+	const q = cross(s, e1), v = f * dot(d, q);
+	if (v < -1e-6 || u + v > 1 + 1e-6) return null;
+	return { dist: f * dot(e2, q), w: [1 - u - v, u, v] };
+}
+
+/**
+ * Whether one box stands for the part within `tol` both ways: every corner of
+ * the part near the box's surface, and every point of the box's surface, on a
+ * grid of `step`, near the part's.
+ */
+function boxFitsPart(box, tris, tol, step) {
+	const pts = uniquePoints(tris);
+	const surfDist = p => {
+		const d = sub(p, box.c);
+		const l = box.axes.map(ax => dot(d, ax));
+		const out = l.map((v, a) => Math.max(0, Math.abs(v) - box.half[a]));
+		if (out.some(v => v > 0)) return len(out);
+		return Math.min(...l.map((v, a) => box.half[a] - Math.abs(v)));
+	};
+	for (const p of pts) if (surfDist(p) > tol) return false;
+	const triDist = p => {
+		let best = Infinity;
+		for (const t of tris) {
+			const w = closestOnTriangle(p, t);
+			const q = [0, 1, 2].map(k => w[0] * t[0][k] + w[1] * t[1][k] + w[2] * t[2][k]);
+			best = Math.min(best, dist(q, p));
+			if (best <= tol) return best;
+		}
+		return best;
+	};
+	for (let a = 0; a < 3; a++) for (const sgn of [-1, 1]) {
+		const [p, q] = [0, 1, 2].filter(x => x !== a);
+		const np = Math.max(1, Math.ceil(2 * box.half[p] / step)), nq = Math.max(1, Math.ceil(2 * box.half[q] / step));
+		for (let i = 0; i <= np; i++) for (let j = 0; j <= nq; j++) {
+			const l = [0, 0, 0];
+			l[a] = sgn * box.half[a];
+			l[p] = -box.half[p] + 2 * box.half[p] * i / np;
+			l[q] = -box.half[q] + 2 * box.half[q] * j / nq;
+			const P = [0, 1, 2].map(k => box.c[k] + l[0] * box.axes[0][k] + l[1] * box.axes[1][k] + l[2] * box.axes[2][k]);
+			if (triDist(P) > tol) return false;
+		}
+	}
+	return true;
+}
+
+/**
+ * Triangles grown into near-flat regions, the largest first: a neighbour across
+ * an edge joins while it turns less than `ang` degrees from the region and its
+ * corners stay within `eps` of the region's plane.
+ *
+ * Hierarchical clustering (Garland, Willmott and Heckbert) was tried in its
+ * place and drew worse edges.
+ */
+function flatRegions(tris, eps, ang) {
+	const info = tris.map(t => {
+		const n = cross(sub(t[1], t[0]), sub(t[2], t[0]));
+		const l = len(n);
+		if (l < 1e-10) return null;
+		return { n: mul(n, 1 / l), a: l / 2, c: [0, 1, 2].map(k => (t[0][k] + t[1][k] + t[2][k]) / 3) };
+	});
+	const byEdge = new Map();
+	tris.forEach((t, i) => {
+		for (let k = 0; k < 3; k++) {
+			const e = edgeKey(pointKey(t[k]), pointKey(t[(k + 1) % 3]));
+			(byEdge.get(e) || byEdge.set(e, []).get(e)).push(i);
+		}
+	});
+	const nbrs = tris.map(() => []);
+	for (const list of byEdge.values()) for (const i of list) for (const j of list) if (i !== j) nbrs[i].push(j);
+	const COS = Math.cos(ang * Math.PI / 180);
+	const used = new Array(tris.length).fill(false);
+	const order = tris.map((_, i) => i).filter(i => info[i]).sort((x, y) => info[y].a - info[x].a);
+	const regions = [];
+	for (const seed of order) {
+		if (used[seed]) continue;
+		used[seed] = true;
+		const list = [seed], queue = [seed];
+		let nSum = mul(info[seed].n, info[seed].a), cSum = mul(info[seed].c, info[seed].a), aSum = info[seed].a;
+		while (queue.length) {
+			const i = queue.pop();
+			for (const j of nbrs[i]) {
+				if (used[j] || !info[j]) continue;
+				const nR = norm(nSum), cR = mul(cSum, 1 / aSum);
+				if (dot(info[j].n, nR) < COS) continue;
+				if (tris[j].some(v => Math.abs(dot(sub(v, cR), nR)) > eps)) continue;
+				used[j] = true; list.push(j); queue.push(j);
+				nSum = add(nSum, mul(info[j].n, info[j].a)); cSum = add(cSum, mul(info[j].c, info[j].a)); aSum += info[j].a;
+			}
+		}
+		regions.push({ tris: list.map(i => tris[i]), n: norm(nSum) });
+	}
+	return regions;
+}
+
+/**
+ * Whether the surface turns sharply across an edge: the triangle on the far side
+ * turns at least `deg` from the one holding corner C, or there is none at all.
+ */
+function creaseTest(tris, deg) {
+	const byEdge = new Map();
+	for (const t of tris) for (let k = 0; k < 3; k++) {
+		const e = edgeKey(pointKey(t[k]), pointKey(t[(k + 1) % 3]));
+		(byEdge.get(e) || byEdge.set(e, []).get(e)).push(t);
+	}
+	const nrm = t => norm(cross(sub(t[1], t[0]), sub(t[2], t[0])));
+	const COS = Math.cos(deg * Math.PI / 180);
+	return (A, B, C) => {
+		const list = byEdge.get(edgeKey(pointKey(A), pointKey(B))) || [];
+		const c = pointKey(C);
+		const own = list.find(t => t.some(q => pointKey(q) === c));
+		const other = list.filter(t => t !== own);
+		if (!own || !other.length) return true;
+		return other.some(t => Math.abs(dot(nrm(own), nrm(t))) < COS);
+	};
+}
+
+function inTri2(x, y, tr) {
+	const [A, B, C] = tr;
+	const s1 = (B[0] - A[0]) * (y - A[1]) - (B[1] - A[1]) * (x - A[0]);
+	const s2 = (C[0] - B[0]) * (y - B[1]) - (C[1] - B[1]) * (x - B[0]);
+	const s3 = (A[0] - C[0]) * (y - C[1]) - (A[1] - C[1]) * (x - C[0]);
+	return (s1 >= 0 && s2 >= 0 && s3 >= 0) || (s1 <= 0 && s2 <= 0 && s3 <= 0);
+}
+function segDist2(x, y, A, B) {
+	const dx = B[0] - A[0], dy = B[1] - A[1], l2 = dx * dx + dy * dy;
+	const k = l2 ? Math.max(0, Math.min(1, ((x - A[0]) * dx + (y - A[1]) * dy) / l2)) : 0;
+	return Math.hypot(x - A[0] - k * dx, y - A[1] - k * dy);
+}
+
+/**
+ * The triangles of a region laid flat, with a grid over them so that finding the
+ * one under a point does not mean testing them all: a region can hold hundreds,
+ * and a sheet at 1/8 px a hundred thousand texels.
+ */
+function flatLocator(polys) {
+	let lo = [Infinity, Infinity], hi = [-Infinity, -Infinity];
+	for (const tr of polys) for (const q of tr) for (let a = 0; a < 2; a++) {
+		if (q[a] < lo[a]) lo[a] = q[a];
+		if (q[a] > hi[a]) hi[a] = q[a];
+	}
+	const span = Math.max(hi[0] - lo[0], hi[1] - lo[1], 1e-6);
+	const cell = Math.max(span / 128, 0.25);
+	const nx = Math.max(1, Math.ceil((hi[0] - lo[0]) / cell) + 1), ny = Math.max(1, Math.ceil((hi[1] - lo[1]) / cell) + 1);
+	const cells = new Map();
+	polys.forEach((tr, i) => {
+		const x0 = Math.floor((Math.min(tr[0][0], tr[1][0], tr[2][0]) - lo[0]) / cell), x1 = Math.floor((Math.max(tr[0][0], tr[1][0], tr[2][0]) - lo[0]) / cell);
+		const y0 = Math.floor((Math.min(tr[0][1], tr[1][1], tr[2][1]) - lo[1]) / cell), y1 = Math.floor((Math.max(tr[0][1], tr[1][1], tr[2][1]) - lo[1]) / cell);
+		for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+			const k = y * nx + x;
+			(cells.get(k) || cells.set(k, []).get(k)).push(i);
+		}
+	});
+	const inside = (x, y) => {
+		const cx = Math.floor((x - lo[0]) / cell), cy = Math.floor((y - lo[1]) / cell);
+		if (cx < 0 || cy < 0 || cx >= nx || cy >= ny) return -1;
+		for (const i of cells.get(cy * nx + cx) || []) if (inTri2(x, y, polys[i])) return i;
+		return -1;
+	};
+	return { inside, count: polys.length, nx, ny };
+}
+
+/**
+ * A flat cube in the plane of a region, and the grid of texels on it.
+ *
+ * Of the ways the plate can be turned in its plane, the one that lays the most
+ * outline length along the texel grid wins: an edge along the grid is drawn
+ * straight, while a slanted one is drawn in steps. The smallest sheet only breaks ties.
+ */
+function plateFor(group, texel) {
+	const n = group.n;
+	const pts = uniquePoints(group.tris);
+	const t = norm(Math.abs(n[0]) < 0.9 ? cross(n, [1, 0, 0]) : cross(n, [0, 1, 0]));
+	const s = cross(n, t);
+	const h = hull2d(pts.map(p => [dot(p, t), dot(p, s)]));
+	const count = new Map();
+	for (const tr of group.tris) for (let k = 0; k < 3; k++) {
+		const e = edgeKey(pointKey(tr[k]), pointKey(tr[(k + 1) % 3]));
+		const entry = count.get(e) || { n: 0, A: tr[k], B: tr[(k + 1) % 3], C: tr[(k + 2) % 3] };
+		entry.n++;
+		count.set(e, entry);
+	}
+	const outline = [];
+	for (const e of count.values()) if (e.n === 1) {
+		const d = [dot(sub(e.B, e.A), t), dot(sub(e.B, e.A), s)];
+		const l = Math.hypot(d[0], d[1]);
+		if (l > 1e-6) outline.push({ phi: Math.atan2(d[1], d[0]), len: l });
+	}
+	const Q = Math.PI / 2, TOL = 0.5 * Math.PI / 180;
+	const alignedLen = phi => outline.reduce((sum, e) => {
+		const dd = (((e.phi - phi) % Q) + Q) % Q;
+		return sum + (Math.min(dd, Q - dd) < TOL ? e.len : 0);
+	}, 0);
+	const dirs = [];
+	for (let i = 0; i < Math.max(1, h.length); i++) {
+		const q = h[(i + 1) % h.length] || [1, 0], o = h[i] || [0, 0];
+		dirs.push(Math.atan2(q[1] - o[1], q[0] - o[0]));
+	}
+	for (const e of outline) dirs.push(e.phi);
+	let best = null, bestAligned = -1;
+	for (const phi of dirs) {
+		const a1 = norm(add(mul(t, Math.cos(phi)), mul(s, Math.sin(phi))));
+		const b = boxAlong([n, a1, cross(n, a1)], pts);
+		const al = alignedLen(phi);
+		const area = b.half[1] * b.half[2];
+		if (!best || al > bestAligned + 1e-6 || (Math.abs(al - bestAligned) <= 1e-6 && area < best.half[1] * best.half[2])) {
+			best = b;
+			bestAligned = al;
+		}
+	}
+	best.half[0] = 0;
+	const [, a1, a2] = best.axes;
+	const corner = sub(sub(best.c, mul(a1, best.half[1])), mul(a2, best.half[2]));
+	const to2 = p => { const d = sub(p, corner); return [dot(d, a1), dot(d, a2)]; };
+	const polys = group.tris.map(tr => tr.map(to2));
+	return {
+		kind: 'plate', group, texel, box: best, corner, a1, a2, to2, polys, edges: count,
+		cols: Math.ceil(2 * best.half[1] / texel), rows: Math.ceil(2 * best.half[2] / texel),
+		// a texel's centre, in the model
+		at: (i, j) => add(add(corner, mul(a1, (i + 0.5) * texel)), mul(a2, (j + 0.5) * texel)),
+	};
+}
+
+/**
+ * The plate's texels that show: a texel shows when its centre lies within the
+ * outline, or within DILATE texels of it. Worked out triangle by triangle over
+ * the texels each one reaches, rather than every triangle for every texel.
+ */
+function plateMask(plate) {
+	const { cols, rows, texel: T, polys } = plate;
+	const dil = ROUND.DILATE * T;
+	const m = new Uint8Array(cols * rows);
+	for (const tr of polys) {
+		const xs = [tr[0][0], tr[1][0], tr[2][0]], ys = [tr[0][1], tr[1][1], tr[2][1]];
+		const i0 = Math.max(0, Math.floor((Math.min(...xs) - dil) / T - 0.5)), i1 = Math.min(cols - 1, Math.ceil((Math.max(...xs) + dil) / T - 0.5));
+		const j0 = Math.max(0, Math.floor((Math.min(...ys) - dil) / T - 0.5)), j1 = Math.min(rows - 1, Math.ceil((Math.max(...ys) + dil) / T - 0.5));
+		for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+			const k = j * cols + i;
+			if (m[k]) continue;
+			const u = (i + 0.5) * T, v = (j + 0.5) * T;
+			if (inTri2(u, v, tr)
+				|| (dil > 0 && (segDist2(u, v, tr[0], tr[1]) <= dil || segDist2(u, v, tr[1], tr[2]) <= dil || segDist2(u, v, tr[2], tr[0]) <= dil))) m[k] = 1;
+		}
+	}
+	return m;
+}
+
+/**
+ * The strips of a plate: one along each slanted edge at least STRIP_MIN long
+ * where the surface turns at least CREASE degrees, or ends.
+ *
+ * Near those edges the plate keeps only the texels lying wholly inside its
+ * outline, so nothing pokes out there, and the notches that leaves are filled by
+ * the strip. The strip stands on the file's own edge, not on the flattened
+ * plate's: the strips of two faces meeting there share one line, and no hairline
+ * opens between them.
+ */
+function stripsFor(plate, sharp) {
+	const T = plate.texel, W = ROUND.STRIP_WIDTH * T;
+	const loc = plate.locator || (plate.locator = flatLocator(plate.polys));
+	const inside = (x, y) => loc.inside(x, y) >= 0;
+	const edges = [];
+	for (const e of plate.edges.values()) {
+		if (e.n !== 1) continue;
+		const A = plate.to2(e.A), B = plate.to2(e.B), C = plate.to2(e.C);
+		const l = Math.hypot(B[0] - A[0], B[1] - A[1]);
+		if (l < 1e-6) continue;
+		const d = [(B[0] - A[0]) / l, (B[1] - A[1]) / l];
+		const phi = ((Math.atan2(d[1], d[0]) % (Math.PI / 2)) + Math.PI / 2) % (Math.PI / 2);
+		const slanted = Math.min(phi, Math.PI / 2 - phi) > 0.5 * Math.PI / 180;
+		let m = [-d[1], d[0]];
+		if ((C[0] - A[0]) * m[0] + (C[1] - A[1]) * m[1] < 0) m = [-m[0], -m[1]];
+		edges.push({ A, B, m, A3: e.A, B3: e.B, strip: slanted && l >= ROUND.STRIP_MIN && sharp(e.A, e.B, e.C) });
+	}
+	plate.stripEdges = edges;
+	const out = [];
+	for (const e of edges) {
+		if (!e.strip) continue;
+		const len3 = dist(e.B3, e.A3);
+		const e1 = norm(sub(e.B3, e.A3));
+		const m3 = add(mul(plate.a1, e.m[0]), mul(plate.a2, e.m[1]));
+		const e2 = norm(sub(m3, mul(e1, dot(m3, e1))));
+		const ns = norm(cross(e1, e2));
+		const A3 = e.A3;
+		out.push({
+			kind: 'strip', owner: plate, step: out.length + 1, group: plate.group, texel: T,
+			box: { c: add(add(A3, mul(e1, len3 / 2)), mul(e2, W / 2)), axes: [ns, e1, e2], half: [0, len3 / 2, W / 2] },
+			corner: A3, a1: e1, a2: e2,
+			cols: Math.ceil(len3 / T), rows: Math.ceil(W / T),
+			at: (i, j) => add(add(A3, mul(e1, (i + 0.5) * T)), mul(e2, Math.max((j + 0.5) * T, 1e-4))),
+			// the whole texel inside the outline, a hair shrunk so the row on the edge
+			// itself counts; corners past the edge are tested on the edge
+			shows: (i, j) => {
+				const u = (i + 0.5) * T, v = (j + 0.5) * T, h = T / 2 - 1e-4;
+				for (const [du, dv] of [[-h, -h], [h, -h], [h, h], [-h, h]]) {
+					const X = plate.to2(add(add(A3, mul(e1, u + du)), mul(e2, Math.max(v + dv, 1e-4))));
+					if (!inside(X[0], X[1])) return false;
+				}
+				return true;
+			},
+		});
+	}
+	return out;
+}
+
+/** The plate's mask once strips take its slanted edges: whole texels only, near them. */
+function plateMaskBesideStrips(plate, mask) {
+	const edges = plate.stripEdges || [];
+	if (!edges.some(e => e.strip)) return mask;
+	const { cols, rows, texel: T } = plate;
+	const loc = plate.locator || (plate.locator = flatLocator(plate.polys));
+	const inside = (x, y) => loc.inside(x, y) >= 0;
+	const h = T / 2 - 1e-6;
+	const done = new Uint8Array(cols * rows);
+	for (const s of edges) {
+		if (!s.strip) continue;
+		const i0 = Math.max(0, Math.floor((Math.min(s.A[0], s.B[0]) - 2 * T) / T)), i1 = Math.min(cols - 1, Math.ceil((Math.max(s.A[0], s.B[0]) + 2 * T) / T));
+		const j0 = Math.max(0, Math.floor((Math.min(s.A[1], s.B[1]) - 2 * T) / T)), j1 = Math.min(rows - 1, Math.ceil((Math.max(s.A[1], s.B[1]) + 2 * T) / T));
+		for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+			const k = j * cols + i;
+			if (done[k]) continue;
+			const u = (i + 0.5) * T, v = (j + 0.5) * T;
+			// the nearest edge of all decides, strip or not
+			let best = Infinity, near = null;
+			for (const e of edges) { const dd = segDist2(u, v, e.A, e.B); if (dd < best) { best = dd; near = e; } }
+			if (!near || !near.strip || best >= 2 * T) continue;
+			done[k] = 1;
+			mask[k] = inside(u - h, v - h) && inside(u + h, v - h) && inside(u + h, v + h) && inside(u - h, v + h) ? 1 : 0;
+		}
+	}
+	return mask;
+}
+
+/**
+ * The shape of one part that is not a box, whatever the texel: one box where one
+ * follows it within FIT_TOL, and otherwise its near-flat regions. Worked out once,
+ * while the texel is tried finest first.
+ */
+function shapePart(tris) {
+	const pts = uniquePoints(tris);
+	if (pts.length >= 4) {
+		const box = minVolumeBox(pts, tris);
+		if (boxFitsPart(box, tris, ROUND.FIT_TOL, Math.min(0.5, ROUND.FIT_TOL))) return { box };
+	}
+	return { tris, regions: flatRegions(tris, ROUND.REGION_EPS, ROUND.REGION_ANGLE) };
+}
+
+/** The cubes of a shaped part at one texel: the box, or a plate per region with its strips when asked for. */
+function piecesAt(shape, texel, strips) {
+	if (shape.box) return [{ kind: 'box', box: shape.box, texel }];
+	const sharp = strips ? (shape.sharp || (shape.sharp = creaseTest(shape.tris, ROUND.CREASE))) : null;
+	const out = [];
+	for (const g of shape.regions) {
+		const plate = plateFor(g, texel);
+		out.push(plate);
+		if (sharp) out.push(...stripsFor(plate, sharp));
+	}
+	return out;
+}
+
+function piecesForPart(tris, texel, strips) {
+	return piecesAt(shapePart(tris), texel, strips);
+}
+
+/**
+ * Texels a piece bakes, for the budget. A whole box counts its six faces too: a
+ * skewed slab kept as one box would otherwise bake at 1/8 px past any budget.
+ */
+function pieceTexels(pc) {
+	if (pc.kind !== 'box') return pc.cols * pc.rows;
+	const h = pc.box.half, T = pc.texel;
+	const side = (p, q) => Math.ceil(2 * h[p] / T - 1e-9) * Math.ceil(2 * h[q] / T - 1e-9);
+	return 2 * (side(1, 2) + side(0, 2) + side(0, 1));
+}
+
+// ------------------------------------------------- rounded parts: the texture
+
+/**
+ * A PNG's pixels, without a canvas: the Node tools have none, and in Blockbench
+ * a canvas may alter colours through colour management. Palette images down to
+ * one bit a pixel are read too — test models carry them. Throws on anything
+ * else, and the caller then asks the canvas.
+ */
+function decodePNG(bytes) {
+	const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	if (bytes.length < 8 || dv.getUint32(0) !== 0x89504E47) throw new Error('not a PNG');
+	let pos = 8, w = 0, h = 0, type = 0, depth = 0, interlace = 0, palette = null, trns = null;
+	const idat = [];
+	while (pos + 8 <= bytes.length) {
+		const n = dv.getUint32(pos);
+		const t = String.fromCharCode(bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]);
+		const d = bytes.subarray(pos + 8, pos + 8 + n);
+		if (t === 'IHDR') { w = dv.getUint32(pos + 8); h = dv.getUint32(pos + 12); depth = d[8]; type = d[9]; interlace = d[12]; }
+		else if (t === 'PLTE') palette = d;
+		else if (t === 'tRNS') trns = d;
+		else if (t === 'IDAT') idat.push(d);
+		else if (t === 'IEND') break;
+		pos += 12 + n;
+	}
+	const ch = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 }[type];
+	if (!ch || interlace || ![1, 2, 4, 8].includes(depth) || (depth < 8 && ch !== 1)) {
+		throw new Error(`PNG kind not read here (type ${type}, depth ${depth}${interlace ? ', interlaced' : ''})`);
+	}
+	let total = 0;
+	for (const d of idat) total += d.length;
+	const z = new Uint8Array(total);
+	let o = 0;
+	for (const d of idat) { z.set(d, o); o += d.length; }
+	const stride = Math.ceil(w * ch * depth / 8), bpp = Math.max(1, ch * depth / 8);
+	// a zlib stream: two bytes of header before the deflate data
+	const raw = inflateRaw(z.subarray(2), (stride + 1) * h);
+	const out = new Uint8ClampedArray(w * h * 4);
+	const packed = (line, x) => (line[(x * depth) >> 3] >> (8 - depth - ((x * depth) & 7))) & ((1 << depth) - 1);
+	let prev = new Uint8Array(stride);
+	for (let y = 0; y < h; y++) {
+		const f = raw[y * (stride + 1)];
+		const line = Uint8Array.from(raw.subarray(y * (stride + 1) + 1, (y + 1) * (stride + 1)));
+		for (let x = 0; x < stride; x++) {
+			const a = x >= bpp ? line[x - bpp] : 0, b = prev[x], c = x >= bpp ? prev[x - bpp] : 0;
+			let v = line[x];
+			if (f === 1) v += a;
+			else if (f === 2) v += b;
+			else if (f === 3) v += (a + b) >> 1;
+			else if (f === 4) { const p = a + b - c, pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c); v += pa <= pb && pa <= pc ? a : pb <= pc ? b : c; }
+			line[x] = v & 255;
+		}
+		for (let x = 0; x < w; x++) {
+			let r, g, bl, al = 255;
+			if (type === 2) { r = line[x * 3]; g = line[x * 3 + 1]; bl = line[x * 3 + 2]; }
+			else if (type === 6) { r = line[x * 4]; g = line[x * 4 + 1]; bl = line[x * 4 + 2]; al = line[x * 4 + 3]; }
+			else if (type === 0) { r = g = bl = depth === 8 ? line[x] : Math.round(packed(line, x) * 255 / ((1 << depth) - 1)); }
+			else if (type === 4) { r = g = bl = line[x * 2]; al = line[x * 2 + 1]; }
+			else {
+				const i = depth === 8 ? line[x] : packed(line, x);
+				if (!palette || i * 3 + 2 >= palette.length) throw new Error('PNG palette index out of range');
+				r = palette[i * 3]; g = palette[i * 3 + 1]; bl = palette[i * 3 + 2];
+				if (trns && i < trns.length) al = trns[i];
+			}
+			const k = (y * w + x) * 4;
+			out[k] = r; out[k + 1] = g; out[k + 2] = bl; out[k + 3] = al;
+		}
+		prev = line;
+	}
+	return { w, h, data: out };
+}
+
+/** The nearest pixel of a picture, the UV wrapping like a repeating sampler. */
+function samplePicture(pic, uv) {
+	if (!pic) return null;
+	const u = uv[0] - Math.floor(uv[0]), v = uv[1] - Math.floor(uv[1]);
+	const x = Math.min(pic.w - 1, Math.floor(u * pic.w)), y = Math.min(pic.h - 1, Math.floor(v * pic.h));
+	const o = (y * pic.w + x) * 4;
+	return [pic.data[o], pic.data[o + 1], pic.data[o + 2], pic.data[o + 3]];
+}
+
+/** A face's UV at barycentric weights, pulled UV_INSET towards the middle. */
+function faceUVAt(face, w) {
+	const k = ROUND.UV_INSET;
+	const v = w.map(x => x * (1 - k) + k / 3);
+	return [0, 1].map(j => v[0] * face.uvs[0][j] + v[1] * face.uvs[1][j] + v[2] * face.uvs[2][j]);
+}
+
+const hasUV = f => !!f && !!f.uvs && f.uvs.length === 3 && f.uvs.every(Boolean);
+
+/**
+ * The colour of each texel of a plate or strip: the source point right under
+ * its centre, found among the region's own triangles and read through their UV.
+ * A texel beyond the outline — the dilated rim — takes the nearest triangle's.
+ */
+function regionPainter(plate, faceOf, pictureOf) {
+	if (plate.painter) return plate.painter;
+	const loc = plate.locator || (plate.locator = flatLocator(plate.polys));
+	const faces = plate.group.tris.map(t => faceOf.get(t));
+	plate.painter = P => {
+		const X = plate.to2(P);
+		let i = loc.inside(X[0], X[1]);
+		let w;
+		if (i >= 0 && hasUV(faces[i])) {
+			const [A, B, C] = plate.polys[i];
+			const den = (B[1] - C[1]) * (A[0] - C[0]) + (C[0] - B[0]) * (A[1] - C[1]);
+			if (Math.abs(den) < 1e-14) i = -1;
+			else {
+				const w0 = ((B[1] - C[1]) * (X[0] - C[0]) + (C[0] - B[0]) * (X[1] - C[1])) / den;
+				const w1 = ((C[1] - A[1]) * (X[0] - C[0]) + (A[0] - C[0]) * (X[1] - C[1])) / den;
+				w = [w0, w1, 1 - w0 - w1];
+			}
+		} else i = -1;
+		if (i < 0) {
+			let bestD = Infinity;
+			plate.polys.forEach((tr, k) => {
+				if (!hasUV(faces[k])) return;
+				const ww = closestOnTriangle([X[0], X[1], 0], tr.map(q => [q[0], q[1], 0]));
+				const qx = ww[0] * tr[0][0] + ww[1] * tr[1][0] + ww[2] * tr[2][0], qy = ww[0] * tr[0][1] + ww[1] * tr[1][1] + ww[2] * tr[2][1];
+				const dd = Math.hypot(qx - X[0], qy - X[1]);
+				if (dd < bestD) { bestD = dd; i = k; w = ww; }
+			});
+		}
+		if (i < 0) return null;
+		return samplePicture(pictureOf(faces[i]), faceUVAt(faces[i], w));
+	};
+	return plate.painter;
+}
+
+/** The colour of a point on a whole box's face: a ray along the face's normal, both ways, onto the part. */
+function boxPainter(faces, pictureOf) {
+	const tris = faces.filter(hasUV);
+	return (C, n) => {
+		let hit = null, hd = Infinity;
+		for (const f of tris) for (const dir of [n, mul(n, -1)]) {
+			const h = rayTriangle(C, dir, f.positions);
+			if (h && h.dist >= -1e-6 && h.dist < hd) { hd = h.dist; hit = { f, w: h.w }; }
+		}
+		if (!hit) for (const f of tris) {
+			const w = closestOnTriangle(C, f.positions);
+			const q = [0, 1, 2].map(k => w[0] * f.positions[0][k] + w[1] * f.positions[1][k] + w[2] * f.positions[2][k]);
+			const dd = dist(q, C);
+			if (dd < hd) { hd = dd; hit = { f, w }; }
+		}
+		return hit ? samplePicture(pictureOf(hit.f), faceUVAt(hit.f, hit.w)) : null;
+	};
+}
+
+/**
+ * The sheets a piece wears: one for a plate or strip, shared by its two sides;
+ * one per face for a whole box. Each is { cols, rows, data } in RGBA, with a
+ * texel either shown or clear — Minecraft cuts at an alpha, it does not blend.
+ * A sheet with nothing shown is null.
+ */
+function bakePiece(pc, faceOf, pictureOf, partFaces) {
+	const put = (sheet, k, col) => {
+		if (!col || col[3] < 128) return false;
+		sheet.data[k * 4] = col[0]; sheet.data[k * 4 + 1] = col[1]; sheet.data[k * 4 + 2] = col[2]; sheet.data[k * 4 + 3] = 255;
+		return true;
+	};
+	if (pc.kind === 'plate' || pc.kind === 'strip') {
+		const { cols, rows } = pc;
+		if (!cols || !rows) return null;
+		const plate = pc.kind === 'plate' ? pc : pc.owner;
+		const paint = regionPainter(plate, faceOf, pictureOf);
+		const sheet = { cols, rows, data: new Uint8ClampedArray(cols * rows * 4) };
+		let any = false;
+		if (pc.kind === 'plate') {
+			const mask = plateMaskBesideStrips(pc, plateMask(pc));
+			for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
+				const k = j * cols + i;
+				if (mask[k] && put(sheet, k, paint(pc.at(i, j)))) any = true;
+			}
+		} else {
+			for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
+				if (pc.shows(i, j) && put(sheet, j * cols + i, paint(pc.at(i, j)))) any = true;
+			}
+		}
+		return any ? [sheet] : null;
+	}
+	// a whole box: six faces, [axis, side], each with its own sheet
+	const paint = boxPainter(partFaces, pictureOf);
+	const T = pc.texel, b = pc.box;
+	const sheets = [];
+	let any = false;
+	for (const [a, sg] of BOX_SIDES) {
+		const [p, q] = [0, 1, 2].filter(x => x !== a);
+		const cols = Math.ceil(2 * b.half[p] / T - 1e-9), rows = Math.ceil(2 * b.half[q] / T - 1e-9);
+		if (!cols || !rows || b.half[p] < 1e-6 || b.half[q] < 1e-6) { sheets.push(null); continue; }
+		const sheet = { cols, rows, data: new Uint8ClampedArray(cols * rows * 4) };
+		const n = mul(b.axes[a], sg);
+		let shown = false;
+		for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
+			const C = add(add(add(b.c, mul(b.axes[a], sg * b.half[a])),
+				mul(b.axes[p], -b.half[p] + (i + 0.5) * T)), mul(b.axes[q], -b.half[q] + (j + 0.5) * T));
+			if (put(sheet, j * cols + i, paint(C, n))) shown = true;
+		}
+		sheets.push(shown ? sheet : null);
+		if (shown) any = true;
+	}
+	return any ? sheets : null;
+}
+// the sides of a box in a fixed order: [axis, sign]
+const BOX_SIDES = [[0, -1], [0, 1], [1, -1], [1, 1], [2, -1], [2, 1]];
+
+// ---------------------------------------- rounded parts: what cannot be seen
+
+/**
+ * The faces of a piece as the cull pass draws them: four corners each, and for
+ * a sheet the texel coordinates at those corners, so a clear texel draws nothing.
+ * `lift` moves a plate or strip along its normal; `grow` inflates a box.
+ */
+function pieceQuads(pc, grow, lift) {
+	const b = pc.box;
+	const out = [];
+	const corner = (c, s) => [0, 1, 2].map(k => c[k] + s[0] * b.axes[0][k] + s[1] * b.axes[1][k] + s[2] * b.axes[2][k]);
+	if (pc.kind === 'plate' || pc.kind === 'strip') {
+		const sheet = pc.sheets && pc.sheets[0];
+		if (!sheet) return out;
+		const T = pc.texel, g = grow || 0;
+		const base = add(pc.corner, mul(b.axes[0], lift || 0));
+		const W = 2 * b.half[1], H = 2 * b.half[2];
+		for (const sg of [-1, 1]) {
+			const c = add(base, mul(b.axes[0], sg * g));
+			const P = [[-g, -g], [W + g, -g], [W + g, H + g], [-g, H + g]].map(([s, t]) => add(add(c, mul(b.axes[1], s)), mul(b.axes[2], t)));
+			out.push({ P, st: [[-g / T, -g / T], [(W + g) / T, -g / T], [(W + g) / T, (H + g) / T], [-g / T, (H + g) / T]], sheet, n: mul(b.axes[0], sg), closed: true });
+		}
+		return out;
+	}
+	const half = b.half.map(h => h + (grow || 0));
+	BOX_SIDES.forEach(([a, sg], f) => {
+		if (pc.skip && pc.skip[f]) return;
+		const [p, q] = [0, 1, 2].filter(x => x !== a);
+		const s = (u, v) => { const l = [0, 0, 0]; l[a] = sg * half[a]; l[p] = u * half[p]; l[q] = v * half[q]; return l; };
+		const P = [s(-1, -1), s(1, -1), s(1, 1), s(-1, 1)].map(l => corner(b.c, l));
+		const sheet = pc.sheets ? pc.sheets[f] : null;
+		if (pc.sheets && !sheet) return;
+		const T = pc.texel || 1;
+		const st = sheet ? [[0, 0], [2 * half[p] / T, 0], [2 * half[p] / T, 2 * half[q] / T], [0, 2 * half[q] / T]] : null;
+		// a box with a side missing shows its inside through the gap
+		const closed = pc.sheets ? pc.sheets.every(Boolean) : !(pc.skip && pc.skip.some(Boolean));
+		out.push({ P, st, sheet, n: mul(b.axes[a], sg), closed });
+	});
+	return out;
+}
+
+/**
+ * The file's own triangles as the cull pass draws them, each texel of their
+ * picture hiding what is behind only where it shows. A Minecraft figure wears an
+ * outer layer that is see-through wherever it is unused, and counted as solid it
+ * would hide the body under it, holes and all.
+ */
+function sourceQuads(faces, pictureOf) {
+	const out = [];
+	for (const f of faces) {
+		const pic = hasUV(f) ? pictureOf(f) : null;
+		const sheet = pic ? { cols: pic.w, rows: pic.h, data: pic.data, wrap: true } : null;
+		const n = norm(cross(sub(f.positions[1], f.positions[0]), sub(f.positions[2], f.positions[0])));
+		out.push({
+			P: f.positions, n, closed: false, sheet,
+			st: sheet ? f.uvs.map(uv => [uv[0] * pic.w, uv[1] * pic.h]) : null,
+		});
+	}
+	return out;
+}
+
+/** The directions the cull pass looks from: every 22.5° around at seven heights, and straight up and down. */
+function cullDirections() {
+	const dirs = [];
+	for (const pitch of [-67.5, -45, -22.5, 0, 22.5, 45, 67.5]) for (let yaw = 0; yaw < 360; yaw += 22.5) dirs.push([yaw, pitch]);
+	dirs.push([0, 89.9], [0, -89.9]);
+	return dirs;
+}
+
+/**
+ * How many pixels each item covers at most, over the directions. Items are
+ * { quads, rigid, cullable }: only items that move together hide one another, so each
+ * rigid set is drawn on its own — a cube behind an arm at rest may be in plain
+ * sight once the arm moves. 26 directions were too few: a cliff seen only from
+ * below slipped between them.
+ *
+ * `tick` is called between drawings and may return a promise, which is awaited:
+ * that is how the work gives way to the interface.
+ */
+async function coverage(items, bounds, tick) {
+	const ext = Math.max(bounds.hi[0] - bounds.lo[0], bounds.hi[1] - bounds.lo[1], bounds.hi[2] - bounds.lo[2]) || 1;
+	const S = ROUND.CULL_SCALE / ext, M = 4;
+	const best = new Int32Array(items.length), count = new Int32Array(items.length);
+	let zbuf = new Float32Array(0), ibuf = new Int32Array(0);
+	const sets = new Map();
+	items.forEach((it, k) => { (sets.get(it.rigid) || sets.set(it.rigid, []).get(it.rigid)).push(k); });
+	const dirs = cullDirections();
+	for (let di = 0; di < dirs.length; di++) {
+		const yaw = dirs[di][0] * Math.PI / 180, pitch = dirs[di][1] * Math.PI / 180;
+		const cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
+		// the view: x across, y up, z away from the viewer
+		const view = v => {
+			const x1 = v[0] * cy - v[2] * sy, z1 = v[0] * sy + v[2] * cy;
+			return [x1, v[1] * cp - z1 * sp, v[1] * sp + z1 * cp];
+		};
+		for (const list of sets.values()) {
+			// a set with nothing that may go need not be drawn at all
+			if (!list.some(k => items[k].cullable)) continue;
+			const pl = [Infinity, Infinity], ph = [-Infinity, -Infinity];
+			const proj = list.map(k => items[k].quads.map(q => q.P.map(view)));
+			for (const qs of proj) for (const q of qs) for (const w of q) for (let a = 0; a < 2; a++) {
+				if (w[a] < pl[a]) pl[a] = w[a];
+				if (w[a] > ph[a]) ph[a] = w[a];
+			}
+			if (!isFinite(pl[0])) continue;
+			const W = Math.ceil((ph[0] - pl[0]) * S + 2 * M), H = Math.ceil((ph[1] - pl[1]) * S + 2 * M);
+			if (W * H > zbuf.length) { zbuf = new Float32Array(W * H); ibuf = new Int32Array(W * H); }
+			const zb = zbuf.subarray(0, W * H).fill(Infinity), id = ibuf.subarray(0, W * H).fill(-1);
+			list.forEach((k, li) => {
+				items[k].quads.forEach((q, qi) => {
+					// a closed box's far side is always behind its near one
+					if (q.closed && view(q.n)[2] > 1e-9) return;
+					const s = proj[li][qi].map(w => [(w[0] - pl[0]) * S + M, H - ((w[1] - pl[1]) * S + M), w[2]]);
+					for (let t = 1; t + 1 < s.length; t++) drawTriangle(s[0], s[t], s[t + 1], q.st && [q.st[0], q.st[t], q.st[t + 1]], q.sheet, k, W, H, zb, id);
+				});
+			});
+			count.fill(0);
+			for (let i = 0; i < id.length; i++) if (id[i] >= 0) count[id[i]]++;
+			for (const k of list) if (count[k] > best[k]) best[k] = count[k];
+		}
+		if (tick) await tick((di + 1) / dirs.length);
+	}
+	return best;
+}
+
+/**
+ * One triangle into the depth and id buffers, a pixel taken when its centre is
+ * inside. The weights are linear across the screen, so they, the depth and the
+ * texel are stepped along a row rather than worked out again for every pixel,
+ * and each row starts and ends where the triangle does.
+ */
+function drawTriangle(a, b, c, st, sheet, k, W, H, zb, id) {
+	const area = (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]);
+	if (Math.abs(area) < 1e-9) return;
+	const inv = 1 / area;
+	// w0 = e0x·x + e0y·y + e0c at a pixel centre (x, y); likewise w1; w2 = 1 - w0 - w1
+	const e0x = (b[1] - c[1]) * inv, e0y = (c[0] - b[0]) * inv, e0c = (b[0] * c[1] - c[0] * b[1]) * inv;
+	const e1x = (c[1] - a[1]) * inv, e1y = (a[0] - c[0]) * inv, e1c = (c[0] * a[1] - a[0] * c[1]) * inv;
+	const dz0 = a[2] - c[2], dz1 = b[2] - c[2];
+	const x0 = Math.max(0, Math.floor(Math.min(a[0], b[0], c[0]))), x1 = Math.min(W - 1, Math.ceil(Math.max(a[0], b[0], c[0])));
+	const y0 = Math.max(0, Math.floor(Math.min(a[1], b[1], c[1]))), y1 = Math.min(H - 1, Math.ceil(Math.max(a[1], b[1], c[1])));
+	let su0 = 0, su1 = 0, su2 = 0, sv0 = 0, sv1 = 0, sv2 = 0, cols = 0, rows = 0, alpha = null, wrap = false;
+	if (sheet) {
+		su0 = st[0][0]; su1 = st[1][0]; su2 = st[2][0]; sv0 = st[0][1]; sv1 = st[1][1]; sv2 = st[2][1];
+		cols = sheet.cols; rows = sheet.rows; alpha = sheet.data; wrap = !!sheet.wrap;
+	}
+	const e2x = -(e0x + e1x);
+	for (let y = y0; y <= y1; y++) {
+		const py = y + 0.5;
+		// the weights at the row's first pixel centre; w2 = 1 - w0 - w1
+		const r0 = e0x * (x0 + 0.5) + e0y * py + e0c, r1 = e1x * (x0 + 0.5) + e1y * py + e1c, r2 = 1 - r0 - r1;
+		// where along the row each weight stays at or above zero
+		let lo = 0, hi = x1 - x0;
+		if (e0x > 0) lo = Math.max(lo, Math.ceil(-r0 / e0x - 1e-7)); else if (e0x < 0) hi = Math.min(hi, Math.floor(r0 / -e0x + 1e-7)); else if (r0 < -1e-12) continue;
+		if (e1x > 0) lo = Math.max(lo, Math.ceil(-r1 / e1x - 1e-7)); else if (e1x < 0) hi = Math.min(hi, Math.floor(r1 / -e1x + 1e-7)); else if (r1 < -1e-12) continue;
+		if (e2x > 0) lo = Math.max(lo, Math.ceil(-r2 / e2x - 1e-7)); else if (e2x < 0) hi = Math.min(hi, Math.floor(r2 / -e2x + 1e-7)); else if (r2 < -1e-12) continue;
+		for (let t = lo; t <= hi; t++) {
+			const w0 = r0 + e0x * t, w1 = r1 + e1x * t, w2 = 1 - w0 - w1;
+			if (w0 < -1e-9 || w1 < -1e-9 || w2 < -1e-9) continue;
+			const i = y * W + x0 + t;
+			const z = c[2] + w0 * dz0 + w1 * dz1;
+			if (z >= zb[i]) continue;
+			if (alpha) {
+				let u = Math.floor(w0 * su0 + w1 * su1 + w2 * su2);
+				let v = Math.floor(w0 * sv0 + w1 * sv1 + w2 * sv2);
+				// a picture repeats; a baked sheet ends at its edge
+				if (wrap) { u = ((u % cols) + cols) % cols; v = ((v % rows) + rows) % rows; }
+				if (u < 0 || v < 0 || u >= cols || v >= rows || alpha[(v * cols + u) * 4 + 3] < 128) continue;
+			}
+			zb[i] = z;
+			id[i] = k;
+		}
+	}
+}
+
+// ------------------------------------------------ rounded parts: the whole pass
+
+/**
+ * Rebuilds the parts that are not boxes, and says which cubes nobody can see.
+ *
+ * input:
+ *   parts   [{ faces, rigid }] — faces with positions, UV in the picture's own
+ *           0..1 and the index of the picture
+ *   boxes   [{ box: { c, axes, half }, faces, rigid }] — the file's own boxes: they
+ *           hide pieces where their texture shows, and they always stay: what an
+ *           author put in is the author's, seen or not
+ *   pictures(face) — the decoded picture a face reads, or null
+ *   mode    'fast' | 'best'
+ * hooks: progress(share, text) may return a promise; stopRequested() says to
+ *   finish sooner (strips for the parts left and the cull are dropped);
+ *   cancelled() says to give up, and null comes back.
+ *
+ * Returns { pieces, texel, stats }: pieces carry { part, kind, box, sheets,
+ * owner?, step? }.
+ */
+async function rebuildNotBoxes(input, hooks) {
+	const h = hooks || {};
+	const say = async (share, text) => { if (h.progress) await h.progress(share, text); };
+	const gone = () => !!(h.cancelled && h.cancelled());
+	const hurry = () => !!(h.stopRequested && h.stopRequested());
+	const strips = input.mode === 'best';
+	const partTris = input.parts.map(p => p.faces.map(f => f.positions));
+	const stats = { parts: input.parts.length, boxes: 0, plates: 0, strips: 0, culled: 0, hurried: false };
+
+	const shapes = [];
+	for (let i = 0; i < input.parts.length; i++) {
+		if (gone()) return null;
+		shapes.push(shapePart(partTris[i]));
+		await say(0.25 * (i + 1) / input.parts.length, `Shaping part ${i + 1} of ${input.parts.length}`);
+	}
+	// the texel: the finest at which the sheets fit the budget
+	let pieces = null, texel = ROUND.TEXELS[0];
+	for (const T of ROUND.TEXELS) {
+		texel = T;
+		pieces = [];
+		let total = 0;
+		for (let i = 0; i < shapes.length; i++) {
+			if (gone()) return null;
+			const withStrips = strips && !hurry();
+			for (const pc of piecesAt(shapes[i], T, withStrips)) { pc.part = i; pieces.push(pc); total += pieceTexels(pc); }
+		}
+		await say(0.3, 'Choosing the texel');
+		if (total <= ROUND.TEXEL_BUDGET) break;
+	}
+
+	// the texture of every piece; a piece with nothing to show goes
+	for (let i = 0; i < pieces.length; i++) {
+		if (gone()) return null;
+		const pc = pieces[i];
+		const part = input.parts[pc.part];
+		if (!part.faceOf) part.faceOf = new Map(part.faces.map(f => [f.positions, f]));
+		pc.sheets = bakePiece(pc, part.faceOf, input.pictures, part.faces);
+		if (i % 50 === 49) await say(0.3 + 0.3 * (i + 1) / pieces.length, `Painting piece ${i + 1} of ${pieces.length}`);
+	}
+	// a strip whose plate went goes with it
+	pieces = pieces.filter(pc => pc.sheets && (pc.kind !== 'strip' || pc.owner.sheets));
+
+	// what nobody sees: drawn from every side, with the layers the import will give
+	// coincident faces, so that the one in front is the one that counts
+	if (!hurry()) {
+		const layered = input.boxes.map(b => ({ center: b.box.c, size: b.box.half.map(x => 2 * x), vx: b.box.axes[0], vy: b.box.axes[1], vz: b.box.axes[2] }))
+			.concat(pieces.filter(pc => pc.kind !== 'strip').map(pc => ({ center: pc.box.c, size: pc.box.half.map(x => 2 * x), vx: pc.box.axes[0], vy: pc.box.axes[1], vz: pc.box.axes[2] })));
+		const inflate = resolveCoplanar(layered).inflate;
+		const growOf = new Map();
+		let k = input.boxes.length;
+		for (const pc of pieces) if (pc.kind !== 'strip') growOf.set(pc, inflate[k++] || 0);
+		const items = input.boxes.map(b => ({ quads: sourceQuads(b.faces, input.pictures), rigid: b.rigid, cullable: false }))
+			.concat(pieces.map(pc => ({
+				quads: pc.kind === 'strip'
+					? pieceQuads(pc, 0, (growOf.get(pc.owner) || 0) + ROUND.LIFT * pc.step)
+					: pieceQuads(pc, growOf.get(pc) || 0),
+				rigid: input.parts[pc.part].rigid,
+				cullable: true,
+			})));
+		const bounds = { lo: [Infinity, Infinity, Infinity], hi: [-Infinity, -Infinity, -Infinity] };
+		for (const tris of partTris) for (const t of tris) for (const q of t) for (let a = 0; a < 3; a++) {
+			if (q[a] < bounds.lo[a]) bounds.lo[a] = q[a];
+			if (q[a] > bounds.hi[a]) bounds.hi[a] = q[a];
+		}
+		for (const b of input.boxes) for (const f of b.faces) for (const q of f.positions) for (let a = 0; a < 3; a++) {
+			if (q[a] < bounds.lo[a]) bounds.lo[a] = q[a];
+			if (q[a] > bounds.hi[a]) bounds.hi[a] = q[a];
+		}
+		let stopped = false;
+		const best = await coverage(items, bounds, async share => {
+			if (gone() || hurry()) { stopped = true; throw new Error('stop'); }
+			await say(0.6 + 0.4 * share, 'Looking for cubes nobody sees');
+		}).catch(e => { if (e && e.message === 'stop') return null; throw e; });
+		if (gone()) return null;
+		if (best && !stopped) {
+			const before = pieces.length;
+			const kept = new Set(pieces.filter((pc, i) => best[input.boxes.length + i] >= ROUND.CULL_PIXELS));
+			// a strip stays only with its plate: it is drawn in the plate's layer
+			pieces = pieces.filter(pc => kept.has(pc) && (pc.kind !== 'strip' || kept.has(pc.owner)));
+			stats.culled = before - pieces.length;
+		} else stats.hurried = true;
+	} else stats.hurried = true;
+	if (strips && hurry()) stats.hurried = true;
+
+	for (const pc of pieces) stats[pc.kind === 'box' ? 'boxes' : pc.kind === 'plate' ? 'plates' : 'strips']++;
+	return { pieces, texel, stats };
+}
+
+/**
+ * A rebuilt piece as the faces solveBox reads: its sides, with the UV of their
+ * sheets. `rectOf(k)` is where sheet k's texels landed, in project UV units; a
+ * plate's one sheet serves both its sides. A box's side with nothing to show
+ * stays in as bare geometry, so the box is still found whole.
+ */
+function pieceFaces(pc, rectOf) {
+	const b = pc.box, T = pc.texel, faces = [];
+	const quad = (P, UV) => {
+		faces.push({ positions: [P[0], P[1], P[2]], uvs: UV ? [UV[0], UV[1], UV[2]] : [null, null, null] });
+		faces.push({ positions: [P[0], P[2], P[3]], uvs: UV ? [UV[0], UV[2], UV[3]] : [null, null, null] });
+	};
+	if (pc.kind === 'plate' || pc.kind === 'strip') {
+		const r = rectOf(pc.sheetIndex[0]);
+		const W = 2 * b.half[1], H = 2 * b.half[2];
+		const st = [[0, 0], [W, 0], [W, H], [0, H]];
+		quad(st.map(([u, v]) => add(add(pc.corner, mul(b.axes[1], u)), mul(b.axes[2], v))),
+			st.map(([u, v]) => [r.x + u / T * r.w / pc.cols, r.y + v / T * r.h / pc.rows]));
+		return faces;
+	}
+	const corners = [[-1, -1], [1, -1], [1, 1], [-1, 1]];
+	BOX_SIDES.forEach(([a, sg], f) => {
+		const [p, q] = [0, 1, 2].filter(x => x !== a);
+		const P = corners.map(([u, v]) => {
+			const l = [0, 0, 0];
+			l[a] = sg * b.half[a]; l[p] = u * b.half[p]; l[q] = v * b.half[q];
+			return [0, 1, 2].map(k => b.c[k] + l[0] * b.axes[0][k] + l[1] * b.axes[1][k] + l[2] * b.axes[2][k]);
+		});
+		const k = pc.sheetIndex ? pc.sheetIndex[f] : undefined;
+		if (k === undefined) { quad(P, null); return; }
+		const sh = pc.sheets[f], r = rectOf(k);
+		quad(P, corners.map(([u, v]) => [r.x + (u + 1) * b.half[p] / T * r.w / sh.cols, r.y + (v + 1) * b.half[q] / T * r.h / sh.rows]));
+	});
+	return faces;
+}
+
+/** A solveBox result as the rebuild's box: centre, axes, half sizes. */
+function boxOfSolution(sol) {
+	return { c: sol.center, axes: [sol.vx, sol.vy, sol.vz], half: sol.size.map(v => Math.abs(v) / 2) };
+}
+
 // ------------------------------------------------------------ Node export
 
 if (typeof Plugin === 'undefined') {
@@ -2832,9 +4235,11 @@ if (typeof Plugin === 'undefined') {
 			solveBox, detectBox, orientations, assignFaces, countUVViolations, buildFaceUV,
 			FACE_DIRS, FACE_NAMES,
 			parseGLTFFiles, parseGLB, parseAnimations, readAccessor, matMul, matFromTRS, matApply, matIdentity,
-			qMul, qConj, qRotate, boneDeltaRotation, boneDeltaPosition, sampleChannel, pickScale, snapScale, texelScale, correctionQuat, packAtlas, splitComponents, boxFromBounds, TRIANGULATE, isDegenerate, imageSize, sniffMime, axisRotationOf, quatFromMat, triangleNormal, snapGrid, snapVec, snapAngle, isIdentityBasis, placeCoords, snapSafely, tidyVec, hasGltfArchive, sketchfabSearchURL, hasAlphaChannel, resolveCoplanar, cubeFaces, faceRectsOverlap,
+			qMul, qConj, qRotate, boneDeltaRotation, boneDeltaPosition, sampleChannel, pickScale, snapScale, texelScale, correctionQuat, packAtlas, splitComponents, insideOutShells, enclosedVolume, boxFromBounds, TRIANGULATE, isDegenerate, imageSize, sniffMime, axisRotationOf, quatFromMat, triangleNormal, snapGrid, snapVec, snapAngle, isIdentityBasis, placeCoords, snapSafely, tidyVec, hasGltfArchive, sketchfabSearchURL, SKETCHFAB_SORTS, sketchfabEmbedURL, sketchfabPageURL, sketchfabArchives, sketchfabCredit, sketchfabDownload, hasAlphaChannel, resolveCoplanar, cubeFaces, faceRectsOverlap,
 			JAVA_BOX, fitJavaBox, applyFit, javaFormatFor, versionBelow, tidyHierarchy, GENERIC_NODE, cubeHint,
+			uniqueName, nameSlug, placeBeside, texturePlan, placeRect,
 			isBlankImage, inflateRaw,
+			ROUND, ROUND_MODES, uniquePoints, hull2d, boxAlong, minVolumeBox, closestOnTriangle, rayTriangle, boxFitsPart, flatRegions, creaseTest, flatLocator, plateFor, plateMask, stripsFor, plateMaskBesideStrips, shapePart, piecesAt, piecesForPart, decodePNG, samplePicture, faceUVAt, regionPainter, boxPainter, bakePiece, BOX_SIDES, pieceQuads, cullDirections, coverage, rebuildNotBoxes, pieceFaces, mapFaceUVs, boxOfSolution, sourceQuads, colourTextureOf,
 			buildCPMFiles, buildCPMConfig, buildCPMAnimations, cpmAlignOffset, cpmEstimateSize, cpmAutoAssign, cpmAutoPose, cpmPoint, cpmDelta, cpmEuler, cpmEulerFromQuat, cpmAngle, cpmUVScale, cpmFaceUV, CPM_PARTS, CPM_PART_NAMES, CPM_FACE,
 		};
 	}
@@ -3704,12 +5109,12 @@ function calibrateAnimRotation(groupByNode, parsed, report) {
  * vector: a swapped axis, a wrong sign or a stray factor can all be read
  * straight off it.
  */
-function verifyAnimationPose(parsed, groupByNode, report) {
+function verifyAnimationPose(parsed, groupByNode, report, nameOf = n => n) {
 	try {
-		const anim = Animation.all.find(a => a.name && parsed.animations.some(x => x.name === a.name
+		const anim = Animation.all.find(a => a.name && parsed.animations.some(x => nameOf(x.name) === a.name
 			&& x.channels.some(c => c.path === 'translation')));
 		if (!anim) { report.push('Pose check: no animation with position channels found'); return; }
-		const src = parsed.animations.find(x => x.name === anim.name);
+		const src = parsed.animations.find(x => nameOf(x.name) === anim.name);
 
 		// Only animate mode computes the pose: in edit mode Animator.preview()
 		// recomputes nothing and the measurement returns the rest pose.
@@ -3824,6 +5229,8 @@ function applyAnimations(parsed, groupByNode, report, opts) {
 		report.push('Animations skipped: the Animation class is unavailable in this build.');
 		return;
 	}
+	// the name an animation takes in the project; an added model's carry its name
+	const nameOf = (opts && opts.animName) || (n => n);
 	report.push(calibrateBoneRotation());
 	probeBonePositionFrame(groupByNode, parsed, report);
 	calibrateAnimRotation(groupByNode, parsed, report);
@@ -3886,7 +5293,7 @@ function applyAnimations(parsed, groupByNode, report, opts) {
 			const isPose = a.length < 1e-6;
 			if (isPose) poses.push(a.name);
 			const anim = new Animation({
-				name: a.name,
+				name: nameOf(a.name),
 				loop: isPose ? 'hold' : 'loop',
 				length: isPose ? 0.25 : a.length,
 			}).add();
@@ -4047,7 +5454,7 @@ function applyAnimations(parsed, groupByNode, report, opts) {
 		}
 	} catch (e) { /* not critical */ }
 
-	verifyAnimationPose(parsed, groupByNode, report);
+	verifyAnimationPose(parsed, groupByNode, report, nameOf);
 
 	// Return the model to its rest pose. Otherwise the last animation stays
 	// selected, Blockbench shows the pose FROM IT, and that is indistinguishable
@@ -4086,7 +5493,7 @@ function applyAnimations(parsed, groupByNode, report, opts) {
  * created immediately and its content filled in once ready, so the whole import
  * does not have to be restructured around waiting.
  */
-function buildAtlasDataURL(images, layout) {
+function buildAtlasDataURL(images, layout, sheets) {
 	return new Promise(resolve => {
 		try {
 			const canvas = document.createElement('canvas');
@@ -4094,6 +5501,14 @@ function buildAtlasDataURL(images, layout) {
 			canvas.height = layout.height;
 			const ctx = canvas.getContext('2d');
 			ctx.imageSmoothingEnabled = false;   // pixel art, no smoothing
+			// The baked sheets of rebuilt parts sit after the pictures in the layout.
+			// They are pixels already, so they go in as one block, before any picture:
+			// putImageData replaces, while drawImage blends over what is there.
+			if (sheets && sheets.length && ctx.createImageData) {
+				const full = ctx.createImageData(layout.width, layout.height);
+				sheets.forEach((sh, k) => writeSheet(full.data, layout.width, layout.rects[images.length + k], sh));
+				ctx.putImageData(full, 0, 0);
+			}
 			let pending = images.length;
 			if (!pending) return resolve(canvas.toDataURL());
 			images.forEach((img, i) => {
@@ -4113,6 +5528,196 @@ function buildAtlasDataURL(images, layout) {
 	});
 }
 
+/**
+ * A baked sheet into an RGBA block, inside `rect` less a border of one texel,
+ * the border repeating the sheet's edge.
+ */
+function writeSheet(data, width, rect, sh) {
+	for (let y = 0; y < rect.h; y++) {
+		const j = Math.min(sh.rows - 1, Math.max(0, y - 1));
+		for (let x = 0; x < rect.w; x++) {
+			const i = Math.min(sh.cols - 1, Math.max(0, x - 1));
+			const from = (j * sh.cols + i) * 4, to = ((rect.y + y) * width + rect.x + x) * 4;
+			data[to] = sh.data[from]; data[to + 1] = sh.data[from + 1]; data[to + 2] = sh.data[from + 2]; data[to + 3] = sh.data[from + 3];
+		}
+	}
+}
+
+/**
+ * A picture's pixels, for baking the sheets of rebuilt parts: a PNG is read here,
+ * anything else — a JPEG from Sketchfab — through a canvas. Null when neither can.
+ */
+function decodePicture(img) {
+	try { return Promise.resolve(decodePNG(img.bytes)); } catch (e) { /* not a PNG read here: the canvas */ }
+	return new Promise(resolve => {
+		try {
+			const el = new Image();
+			el.onload = () => {
+				try {
+					const w = el.naturalWidth || el.width, h = el.naturalHeight || el.height;
+					const canvas = document.createElement('canvas');
+					canvas.width = w;
+					canvas.height = h;
+					const ctx = canvas.getContext('2d');
+					ctx.drawImage(el, 0, 0);
+					resolve({ w, h, data: ctx.getImageData(0, 0, w, h).data });
+				} catch (e) { resolve(null); }
+			};
+			el.onerror = () => resolve(null);
+			el.src = 'data:' + (img.mime || 'image/png') + ';base64,' + bytesToBase64(img.bytes);
+		} catch (e) { resolve(null); }
+	});
+}
+
+/**
+ * Long work with a window that shows how far it got and lets it be cut short.
+ *
+ * `run(hooks)` gets the hooks rebuildNotBoxes takes. Its progress calls give way
+ * to the interface every few dozen milliseconds, so Blockbench keeps drawing and
+ * the buttons answer. Finish now keeps what is done and hurries the rest; Cancel
+ * throws it all away, and the promise then gives null.
+ */
+function withProgress(title, run) {
+	let stop = false, cancel = false, last = Date.now();
+	let fill = null, text = null, dialog = null;
+	try {
+		dialog = new Dialog({
+			id: PLUGIN_ID + '_progress',
+			title,
+			width: 460,
+			cancel_on_click_outside: false,
+			buttons: ['Finish now', 'Cancel import'],
+			confirmIndex: 0,
+			cancelIndex: 1,
+			lines: ['<div class="mtc_prog">'
+				+ '<div class="mtc_prog_text" style="margin-bottom:8px">Starting</div>'
+				+ '<div style="height:6px;border-radius:3px;background:var(--color-back,#21252b);overflow:hidden">'
+				+ '<div class="mtc_prog_fill" style="height:100%;width:0;background:var(--color-accent,#3e90ff)"></div></div>'
+				+ '<p style="opacity:0.7;margin-top:10px">Finish now keeps what is done: the parts left get no edge strips, '
+				+ 'and cubes nobody sees are kept. Cancel import leaves the project as it was.</p></div>'],
+			onConfirm() { stop = true; if (text) text.textContent = 'Finishing'; return false; },
+			onCancel() { cancel = true; if (text) text.textContent = 'Cancelling'; return false; },
+		});
+		dialog.show();
+		const root = dialog.object || document;
+		fill = root.querySelector('.mtc_prog_fill');
+		text = root.querySelector('.mtc_prog_text');
+	} catch (e) { /* the work goes on without a window */ }
+	const pause = () => (typeof setTimeout === 'function' ? new Promise(r => setTimeout(r, 0)) : Promise.resolve());
+	const hooks = {
+		progress(share, what) {
+			if (Date.now() - last < 40) return null;
+			last = Date.now();
+			if (fill && fill.style) fill.style.width = Math.round(100 * share) + '%';
+			if (text && !stop && !cancel) text.textContent = what;
+			try { Blockbench.setProgress(share); } catch (e) { /* only the taskbar */ }
+			return pause();
+		},
+		stopRequested: () => stop,
+		cancelled: () => cancel,
+	};
+	const close = () => {
+		try { Blockbench.setProgress(0); } catch (e) { /* only the taskbar */ }
+		try { if (dialog) dialog.hide(); } catch (e) { /* already gone */ }
+	};
+	return pause().then(() => run(hooks)).then(
+		result => { close(); return cancel ? null : result; },
+		e => { close(); throw e; });
+}
+
+/** The open project's format, when the import can build into it; null otherwise. */
+function openProjectTarget() {
+	try {
+		if (typeof Project === 'undefined' || !Project || typeof Format === 'undefined' || !Format) return null;
+		return TARGETS.find(t => t.id === Format.id) || null;
+	} catch (e) {
+		return null;
+	}
+}
+
+/**
+ * Where an added model goes: into the selected folder, or the folder of the
+ * selected cube, around that folder's pivot; to the top level otherwise. A sword
+ * lands in the hand it is meant for and turns with it.
+ *
+ * Blockbench 5 names the selected folder Group.first_selected and makes
+ * Group.selected a list; Blockbench 4 keeps the folder itself in Group.selected.
+ */
+function attachPoint() {
+	const folder = v => (v && !Array.isArray(v) && Array.isArray(v.children) && Array.isArray(v.origin) ? v : null);
+	let group = null;
+	try {
+		group = folder(Group.first_selected) || folder(Group.selected)
+			|| (Array.isArray(Group.selected) ? folder(Group.selected[0]) : null);
+		if (!group && typeof Outliner !== 'undefined') group = folder(((Outliner.selected || [])[0] || {}).parent);
+	} catch (e) { /* nothing selected */ }
+	return group ? { group, point: group.origin.slice() } : { group: null, point: [0, 0, 0] };
+}
+
+/** The names in use in a list of folders or animations. */
+function namesIn(list) {
+	try {
+		return new Set((list || []).map(x => x && x.name).filter(Boolean));
+	} catch (e) {
+		return new Set();
+	}
+}
+
+/** The texture a one-texture format draws every face with. */
+function projectTexture() {
+	try {
+		return (Texture.getDefault && Texture.getDefault()) || Texture.all[0] || null;
+	} catch (e) {
+		return null;
+	}
+}
+
+/**
+ * Why the atlas cannot be drawn beside this project texture, or null when it can.
+ * The texture is redrawn as one picture, and that would flatten layers and break
+ * the frames of an animated one; a texture that never loaded would be replaced
+ * with an empty sheet.
+ */
+function besideProblem(tex) {
+	if (!tex) return null;
+	if (tex.error || !tex.width || !tex.height) return 'The project texture has not loaded, so nothing can be drawn beside it.';
+	if (tex.layers_enabled) return 'The project texture has layers, and drawing the model\'s texture beside it would merge them. Merge its layers into one and run the import again.';
+	if (tex.frameCount > 1) return 'The project texture is animated, and the model\'s texture beside it would break its frames.';
+	return null;
+}
+
+/**
+ * The project texture with the model's atlas drawn beside it, as a data URL.
+ * Drawn at the project texture's own resolution — a 64×64 UV space painted at
+ * 128×128 gets the atlas doubled — so every UV keeps meaning the same pixels.
+ * `base` is null when the project had no texture yet.
+ */
+function composeBeside(base, plan, oldSize, atlasSize, atlasURL) {
+	return new Promise(resolve => {
+		try {
+			const px = base ? base.width / oldSize[0] : 1;
+			const py = base ? base.height / oldSize[1] : 1;
+			const canvas = document.createElement('canvas');
+			canvas.width = Math.round(plan.uvSize[0] * px);
+			canvas.height = Math.round(plan.uvSize[1] * py);
+			const ctx = canvas.getContext('2d');
+			ctx.imageSmoothingEnabled = false;
+			if (base) ctx.drawImage(base.canvas && base.canvas.width ? base.canvas : base.img, 0, 0, base.width, base.height);
+			const el = new Image();
+			el.onload = () => {
+				try {
+					ctx.drawImage(el, plan.offset[0] * px, plan.offset[1] * py, atlasSize[0] * px, atlasSize[1] * py);
+				} catch (e) { /* the old texture is still there */ }
+				resolve(canvas.toDataURL());
+			};
+			el.onerror = () => resolve(null);
+			el.src = atlasURL;
+		} catch (e) {
+			resolve(null);
+		}
+	});
+}
+
 /** Builds a project from an unpacked archive. */
 /**
  * What the last import produced. The CPM export needs the same hierarchy, boxes
@@ -4123,12 +5728,18 @@ function buildAtlasDataURL(images, layout) {
  */
 let lastImport = null;
 
-function buildFromFiles(files, sourceName, opts) {
+async function buildFromFiles(files, sourceName, opts) {
 	const report = [];
 
 	// The format goes first: finding out there is nothing to build into after the
-	// whole parse would waste it.
-	const target = targetById((opts && opts.target) || 'geckolib_model');
+	// whole parse would waste it. Added to the open project, the model takes that
+	// project's format.
+	const adding = !!(opts && opts.add_to_open);
+	const target = adding ? openProjectTarget() : targetById((opts && opts.target) || 'geckolib_model');
+	if (!target) {
+		Blockbench.showMessageBox({ title: 'Import failed', message: 'No open project in a format the model can be added to.' });
+		return;
+	}
 	const format = typeof Formats !== 'undefined' && Formats[target.id];
 	if (!format) {
 		if (target.id === 'geckolib_model') requireGeckolib();
@@ -4198,6 +5809,10 @@ function buildFromFiles(files, sourceName, opts) {
 		report.push(`Faces with no texture: ${probe.blank.triangles / 2 | 0} kept hidden, as they were in `
 			+ 'Blockbench' + (probe.blank.objects ? `; ${probe.blank.objects} objects made only of them left out` : ''));
 	}
+	if (probe.outlineShells) {
+		report.push(`Outline shells left out: ${probe.outlineShells} — inside-out copies that draw a dark rim `
+			+ 'where back faces are culled, and would cover the model as cubes');
+	}
 	if (unread) report.push(`Images skipped: ${unread} — format not recognised`);
 	// Said plainly, because it is the honest explanation for a model that arrives
 	// wearing one texture everywhere: the file itself points all of its geometry
@@ -4205,6 +5820,16 @@ function buildFromFiles(files, sourceName, opts) {
 	if (unreached) report.push(`Colour textures no mesh references: ${unreached} of `
 		+ `${unreached + images.length} — left out of the atlas, and nothing in the `
 		+ 'file says which parts they belong to');
+	// When every part points at one picture and the others lie unused, the file has
+	// lost which parts use which material. Exporters do not write materials nobody
+	// uses, so this is a damaged file, and it is said up front: otherwise the wrong
+	// colours read as the import's fault. Seen on files where every part, effects
+	// included, wore the one texture.
+	const lostMaterials = unreached && reached.size === 1
+		? `Every part of this file points at one texture, while ${unreached} more are not used by any part. `
+			+ 'The file has most likely lost which parts use which material, so colours will land on the '
+			+ 'wrong parts. Getting the model again from its source is the fix; the import cannot tell.'
+		: null;
 
 	// Transparency the material asks for and the picture cannot give.
 	//
@@ -4215,13 +5840,13 @@ function buildFromFiles(files, sourceName, opts) {
 	// reference set — the one model whose texture kept its alpha is the one whose
 	// textures were reported as fine.
 	//
-	// This says nothing about the model and everything about the download, so it
-	// is worth stating plainly rather than being worked around.
+	// Stated as a mismatch, not as a loss: some models set BLEND on a texture that
+	// never had alpha, and there nothing is missing. Guessing a transparent colour
+	// was measured and rejected — black is also outlines and dark details.
 	const flat = images.filter(img => hasAlphaChannel(img.bytes) === false).length;
 	if (probe.wantsAlpha && flat === images.length) {
-		report.push('Texture without an alpha channel, though the material asks for '
-			+ 'transparency — anything meant to be see-through will arrive opaque. '
-			+ 'A download that keeps alpha is needed; this cannot be recovered here.');
+		report.push('The material asks for transparency, but the texture has no alpha '
+			+ 'channel — any see-through parts will arrive opaque.');
 	}
 
 	// The main texture is the one most objects use: its size defines the
@@ -4234,14 +5859,23 @@ function buildFromFiles(files, sourceName, opts) {
 	let mainIndex = 0, mainCount = -1;
 	images.forEach((img, i) => { if ((usage[i] || 0) > mainCount) { mainCount = usage[i] || 0; mainIndex = i; } });
 
-	// Every texture is packed into one atlas: GeckoLib supports one per model, and
-	// differing sizes cannot otherwise coexist in a shared project UV space.
-	// For a single image the atlas degenerates into that image.
-	const layout = packAtlas(images.map(img => img.size));
-	const needAtlas = images.length > 1;
-	const size = { width: layout.width, height: layout.height };
-	if (needAtlas) {
-		report.push(`Textures in archive: ${images.length} → packed into a ${layout.width}×${layout.height} atlas`);
+	// Added to the open project: where the model goes, and how its texture joins
+	// the project's (see texturePlan). Decided before anything is built, so a
+	// texture the atlas cannot join stops the import with the project untouched.
+	const host = adding ? attachPoint() : null;
+	const oldSize = adding ? [Project.texture_width, Project.texture_height] : null;
+	let texKind = 'fresh', baseTexture = null;
+	if (adding) {
+		const empty = !Texture.all.length && !((typeof Outliner !== 'undefined' && Outliner.elements) || []).length;
+		texKind = empty ? 'fresh' : Format.per_texture_uv_size ? 'own' : Format.single_texture ? 'beside' : 'shared';
+		if (texKind === 'beside') {
+			baseTexture = projectTexture();
+			const problem = besideProblem(baseTexture);
+			if (problem) {
+				Blockbench.showMessageBox({ title: 'Cannot add the model', message: problem });
+				return;
+			}
+		}
 	}
 
 	// Coordinate scale: for Blockbench a glTF unit is a block, for Sketchfab
@@ -4311,28 +5945,33 @@ function buildFromFiles(files, sourceName, opts) {
 		report.push('  enable Centre the model if that is a problem');
 	}
 
+	// Said, because the two archives of one model can differ (see sketchfabArchives).
+	if (opts && opts.original) {
+		report.push('Downloaded: the author\'s original, uploaded from Blockbench — Sketchfab\'s own '
+			+ 'conversion can lose transparency and wraps the model in extra nodes');
+	}
 	// Licence: most downloadable models require attribution, and losing that
 	// information during import is not acceptable.
 	const licenseKey = Object.keys(files).find(n => /license[.]txt$/i.test(n));
 	if (licenseKey) {
 		const text = new TextDecoder().decode(files[licenseKey]).trim();
-		report.push('Licence from the archive:');
+		// the original has no licence file; its credit is made from the model page
+		report.push(opts && opts.original ? 'Licence from the model page:' : 'Licence from the archive:');
 		for (const l of text.split(String.fromCharCode(10)).map(x => x.trim()).filter(Boolean).slice(0, 4)) {
 			report.push('  ' + l);
 		}
 	}
 
+	// Added into a folder, the model stands on that folder's pivot.
+	if (host && host.group) {
+		report.push(`Placed at the pivot of “${host.group.name}”: [${host.point.map(v => +v.toFixed(2)).join(', ')}]`);
+	}
+	// The UV stay in each picture's own 0..1 for now: the rebuild of the parts
+	// that are not boxes reads the pictures through them, and the atlas can only
+	// be laid out once it knows what the rebuild adds. They move into it below.
 	const parsed = parseGLTFFiles(files, {
-		scale: chosenScale, offset, rotate,
-		uvWidth: size.width, uvHeight: size.height,
-		// The rectangles are converted to glTF numbering too: the parser knows only
-		// that. Objects with an unreadable texture get a piece of the main one:
-		// a wrong patch beats UV flying outside the atlas.
-		uvRects: sized.map((img, i) => layout.rects[remap[i] >= 0 ? remap[i] : mainIndex]),
-		// And the same piece for an object that names no image at all: its UV were
-		// authored inside some single picture, so the main one is the best guess
-		// available, and any guess beats spreading them over the whole atlas.
-		uvFallback: layout.rects[mainIndex],
+		scale: chosenScale, offset: host ? add(offset, host.point) : offset, rotate,
+		uvWidth: 1, uvHeight: 1,
 	});
 	if (rotate.some(v => v)) report.push(`Extra rotation: X ${rotate[0]}°, Y ${rotate[1]}°`);
 
@@ -4374,14 +6013,15 @@ function buildFromFiles(files, sourceName, opts) {
 	// Objects are sorted into three buckets. A single bad object used to cancel
 	// the whole import — the journal shows that for six models out of forty
 	// exactly one object was in the way, and the whole model was lost.
-	const badMode = (opts && opts.bad_objects) || 'box';
+	const badMode = (opts && opts.bad_objects) || 'rebuild';
 	const notBoxes = [];
 	const skipped = [];
 	let degenerate = 0;
 	for (const obj of parsed.objects) {
 		if (isDegenerate(obj.faces)) { degenerate++; obj.drop = true; continue; }
 		const sol = solveBox(obj.faces);
-		if (!sol.error) continue;
+		// the box as found, for the rebuild: it hides what lies behind it
+		if (!sol.error) { obj.box = sol; continue; }
 		notBoxes.push(`${obj.name}: ${sol.error}`);
 		if (badMode === 'abort') continue;
 		obj.bad = true;
@@ -4391,7 +6031,8 @@ function buildFromFiles(files, sourceName, opts) {
 	if (degenerate) report.push(`Degenerate fragments dropped: ${degenerate}`);
 	if (notBoxes.length) {
 		report.push(`Not boxes: ${notBoxes.length} — `
-			+ (badMode === 'skip' ? 'skipped' : badMode === 'box' ? 'replaced with their bounding box' : 'import cancelled'));
+			+ (badMode === 'skip' ? 'skipped' : badMode === 'box' ? 'replaced with their bounding box'
+				: badMode === 'rebuild' ? 'rebuilt from plates' : 'import cancelled'));
 		for (const n of notBoxes.slice(0, 5)) report.push('  ' + n);
 	}
 	if (notBoxes.length && badMode === 'abort') {
@@ -4400,22 +6041,113 @@ function buildFromFiles(files, sourceName, opts) {
 			message: `Could not represent ${notBoxes.length} of ${parsed.objects.length} objects as cubes.\n\n`
 				+ notBoxes.slice(0, 12).join('\n')
 				+ (notBoxes.length > 12 ? `\n…and ${notBoxes.length - 12} more` : '')
-				+ '\n\nSupport for arbitrary geometry (voxelisation) is not implemented yet.',
+				+ '\n\nTo import it anyway, pick another way for such objects in the advanced settings: '
+				+ 'by default they are rebuilt from plates.',
 		});
 		return;
 	}
 
-	newProject(format);
-	Project.name = (sourceName || 'model').replace(/\.[^.]*$/, '');
-	// IMPORTANT: geckolib_model and bedrock default to box_uv = true, while we need
-	// per-face UV, otherwise Blockbench re-unwraps them and the layout is lost.
-	Project.box_uv = false;
-	Project.texture_width = size.width;
-	Project.texture_height = size.height;
-	// Bedrock names the geometry after this identifier, and an empty one is
-	// exported as geometry.unknown.
-	if (target.id === 'bedrock' && !Project.model_identifier) {
-		Project.model_identifier = Project.name.toLowerCase().replace(/[^a-z0-9_.]+/g, '_') || 'model';
+	// Step 1b. The objects that are not boxes, rebuilt from plates. Before anything
+	// is created, so that stopping it leaves the project as it was.
+	let rebuilt = null;
+	const rebuildMode = ROUND_MODES.includes(opts && opts.rounded) ? opts.rounded : 'fast';
+	const bad = badMode === 'rebuild' ? parsed.objects.filter(o => o.bad) : [];
+	if (bad.length) {
+		const began = Date.now();
+		const pictures = await Promise.all(images.map(decodePicture));
+		const pictureOf = face => {
+			const i = face.image >= 0 && remap[face.image] >= 0 ? remap[face.image] : mainIndex;
+			return pictures[i] || pictures[mainIndex] || null;
+		};
+		// Only what moves together can hide itself: a cube behind an arm at rest is
+		// in plain sight once the arm moves. So each set of objects under the same
+		// animated node is looked at on its own.
+		const moving = new Set();
+		if (!target.still && !(opts && opts.animations === false)) {
+			for (const a of parsed.animations) for (const ch of a.channels) moving.add(ch.node);
+		}
+		const up = new Map(parsed.hierarchy.map(h => [h.index, h.parent]));
+		const rigidOf = node => {
+			for (let n = node; n !== undefined && n >= 0; n = up.get(n)) if (moving.has(n)) return n;
+			return -1;
+		};
+		const whole = parsed.objects.filter(o => !o.bad && o.box);
+		rebuilt = await withProgress(`Rebuilding ${bad.length} parts that are not cubes`, hooks => rebuildNotBoxes({
+			parts: bad.map(o => ({ faces: o.faces, rigid: rigidOf(o.node) })),
+			boxes: whole.map(o => ({ box: boxOfSolution(o.box), faces: o.faces, rigid: rigidOf(o.node) })),
+			pictures: pictureOf,
+			mode: rebuildMode,
+		}, hooks));
+		if (!rebuilt) return null;   // cancelled, and nothing was touched
+		rebuilt.objects = bad;
+		rebuilt.seconds = (Date.now() - began) / 1000;
+	}
+
+	// Every texture is packed into one atlas: GeckoLib supports one per model, and
+	// differing sizes cannot otherwise coexist in a shared project UV space.
+	// For a single image the atlas degenerates into that image.
+	//
+	// The rebuilt pieces add their sheets, each with a border of one texel that
+	// repeats its edge: a sampler rounding at the very edge then reads the same colour.
+	const sheetList = [];
+	if (rebuilt) {
+		for (const pc of rebuilt.pieces) {
+			pc.sheetIndex = [];
+			pc.sheets.forEach((sh, f) => { if (sh) { pc.sheetIndex[f] = sheetList.length; sheetList.push(sh); } });
+		}
+	}
+	const layout = packAtlas(images.map(img => img.size).concat(sheetList.map(sh => ({ width: sh.cols + 2, height: sh.rows + 2 }))));
+	const needAtlas = images.length > 1 || sheetList.length > 0;
+	const size = { width: layout.width, height: layout.height };
+	if (needAtlas) {
+		report.push(`Textures in archive: ${images.length}`
+			+ (sheetList.length ? `, and ${sheetList.length} sheets baked for the rebuilt parts` : '')
+			+ ` → packed into a ${layout.width}×${layout.height} atlas`);
+	}
+	if (Math.max(layout.width, layout.height) > 4096) {
+		report.push(`WARNING: the texture is ${layout.width}×${layout.height}, more than many graphics cards take.`);
+	}
+	const plan = texturePlan(texKind, oldSize, [size.width, size.height]);
+	// Objects with an unreadable texture get a piece of the main one: a wrong patch
+	// beats UV flying outside the atlas. And the same piece for an object that
+	// names no image at all: its UV were authored inside some single picture, so
+	// the main one is the best guess available.
+	mapFaceUVs(parsed.objects,
+		sized.map((img, i) => placeRect(layout.rects[remap[i] >= 0 ? remap[i] : mainIndex], plan)),
+		placeRect(layout.rects[mainIndex], plan), plan.uvSize);
+	const sheetRect = k => {
+		const r = layout.rects[images.length + k];
+		return placeRect({ x: r.x + 1, y: r.y + 1, w: r.w - 2, h: r.h - 2 }, plan);
+	};
+
+	// What an added model changes is one edit, so a single Ctrl+Z takes it all
+	// back: its folders and cubes, its animations, and the texture it added or
+	// grew. It is closed once the texture has its pixels, or undo would restore
+	// an empty one.
+	const animsBefore = adding ? new Set(Animation.all) : null;
+	if (adding) {
+		// Cubes are added in Edit mode; in Animate mode a pose would be showing.
+		try { if (Modes.animate && Modes.options.edit) Modes.options.edit.select(); } catch (e) { /* stay */ }
+		Undo.initEdit({
+			elements: [], outliner: true, textures: baseTexture ? [baseTexture] : [], bitmap: true,
+			uv_mode: true, animations: [], selection: true,
+		});
+	} else {
+		newProject(format);
+		Project.name = (sourceName || 'model').replace(/\.[^.]*$/, '');
+		// IMPORTANT: geckolib_model and bedrock default to box_uv = true, while we need
+		// per-face UV, otherwise Blockbench re-unwraps them and the layout is lost.
+		// An open project keeps its own: each cube carries its UV mode.
+		Project.box_uv = false;
+		// Bedrock names the geometry after this identifier, and an empty one is
+		// exported as geometry.unknown.
+		if (target.id === 'bedrock' && !Project.model_identifier) {
+			Project.model_identifier = Project.name.toLowerCase().replace(/[^a-z0-9_.]+/g, '_') || 'model';
+		}
+	}
+	if (plan.projectSize) {
+		Project.texture_width = plan.projectSize[0];
+		Project.texture_height = plan.projectSize[1];
 	}
 
 	// One texture per project, as GeckoLib and Bedrock require.
@@ -4423,21 +6155,42 @@ function buildFromFiles(files, sourceName, opts) {
 	// a Sketchfab JPEG must first go through a canvas, or it lands in the project
 	// labelled png and fails to open.
 	const needRedraw = needAtlas || (images[0].mime && images[0].mime !== 'image/png');
-	const atlasTexture = new Texture({ name: needAtlas ? 'atlas.png' : (images[0].name || 'texture.png').replace(/\.[^.]*$/, '.png') });
-	// Generic models measure UV against each texture's own size rather than the
-	// project's. The constructor copies the project's size, set just above; it is
-	// written out anyway, so the UV never depend on when the atlas finishes drawing.
-	atlasTexture.uv_width = size.width;
-	atlasTexture.uv_height = size.height;
-	if (needRedraw) {
-		atlasTexture.add();
-		// the content is filled in once the images decode
-		buildAtlasDataURL(images, layout).then(url => {
-			if (url) atlasTexture.fromDataURL(url);
-			Canvas.updateAll();
-		});
+	const firstURL = 'data:' + (images[0].mime || 'image/png') + ';base64,' + bytesToBase64(images[0].bytes);
+	const atlasURL = () => (needRedraw ? buildAtlasDataURL(images, layout, sheetList) : Promise.resolve(firstURL));
+	// Beside an existing texture, or on a sheet sized to keep the UV of cubes
+	// already in the project, the atlas is drawn into a bigger picture.
+	const besides = texKind === 'beside';
+	const beside = () => atlasURL().then(url => url && composeBeside(baseTexture, plan, oldSize, [size.width, size.height], url));
+	let atlasTexture = baseTexture;
+	let texReady;
+	const filled = tex => url => {
+		if (url) tex.fromDataURL(url);
+		else if (besides) {
+			Blockbench.showMessageBox({ title: 'Texture not drawn', message: 'The model\'s texture could not be drawn '
+				+ 'beside the project\'s, so its cubes show the wrong pixels. Ctrl+Z takes the import back.' });
+		}
+		Canvas.updateAll();
+	};
+	if (atlasTexture) {
+		texReady = beside().then(filled(atlasTexture));
 	} else {
-		atlasTexture.fromDataURL('data:' + (images[0].mime || 'image/png') + ';base64,' + bytesToBase64(images[0].bytes)).add();
+		atlasTexture = new Texture({
+			name: adding ? nameSlug(sourceName) + '.png'
+				: needAtlas ? 'atlas.png' : (images[0].name || 'texture.png').replace(/\.[^.]*$/, '.png'),
+		});
+		// Generic models measure UV against each texture's own size rather than the
+		// project's. The constructor copies the project's size, set just above; it is
+		// written out anyway, so the UV never depend on when the atlas finishes drawing.
+		atlasTexture.uv_width = plan.uvSize[0];
+		atlasTexture.uv_height = plan.uvSize[1];
+		if (needRedraw || besides) {
+			atlasTexture.add();
+			// the content is filled in once the images decode
+			texReady = (besides ? beside() : buildAtlasDataURL(images, layout, sheetList)).then(filled(atlasTexture));
+		} else {
+			atlasTexture.fromDataURL(firstURL).add();
+			texReady = Promise.resolve();
+		}
 	}
 
 	// Step 2. Measure Blockbench conventions — that needs a live project.
@@ -4451,12 +6204,50 @@ function buildFromFiles(files, sourceName, opts) {
 	const solved = [];
 	let approximated = 0;
 	for (const obj of parsed.objects) {
+		if (obj.bad && rebuilt) continue;
 		const sol = solveBox(obj.faces);
 		if (!sol.error) { solved.push({ obj, sol }); continue; }
 		if (badMode !== 'box') continue;
 		const approx = boxFromBounds(obj.faces);
 		if (approx) { solved.push({ obj, sol: approx }); approximated++; }
 	}
+	// The rebuilt pieces, as cubes: the faces of each, with the UV of its sheets,
+	// go through the same solver as the file's own boxes.
+	let unsolved = 0;
+	if (rebuilt) {
+		for (const pc of rebuilt.pieces) {
+			const sol = solveBox(pieceFaces(pc, sheetRect));
+			if (sol.error) { unsolved++; continue; }
+			solved.push({ obj: rebuilt.objects[pc.part], sol, piece: pc });
+		}
+	}
+
+	if (rebuilt) {
+		const st = rebuilt.stats;
+		const T = rebuilt.texel;
+		report.push(`Rebuilt, ${rebuildMode === 'best' ? 'best quality' : 'fast'}: ${st.parts} parts → `
+			+ `${st.plates} plates` + (st.strips ? `, ${st.strips} edge strips` : '')
+			+ (st.boxes ? `, ${st.boxes} whole boxes` : '')
+			+ `; texel ${T >= 1 ? T : '1/' + Math.round(1 / T)} px; ${rebuilt.seconds.toFixed(1)} s`);
+		if (st.hurried) {
+			report.push('  finished early: ' + (rebuildMode === 'best' ? 'the parts left got no strips, and ' : '')
+				+ 'cubes nobody sees were kept');
+		} else if (st.culled) {
+			report.push(`  pieces nobody sees, left out: ${st.culled} — looked at from 114 directions; `
+				+ 'what an animation could reveal stays, and so does every cube of the file itself');
+		}
+		if (unsolved) report.push(`  pieces that could not be made into cubes: ${unsolved}`);
+		// A plate cuts its outline out of a rectangle with clear texels, and a
+		// renderer that blends or ignores alpha shows the rectangle instead.
+		const cut = {
+			geckolib_model: 'GeckoLib draws it that way by default',
+			bedrock: 'the entity needs the entity_alphatest material',
+			java_block: 'a block needs a cutout render type; items have it',
+			free: 'keep the texture\'s transparency wherever the model goes',
+		}[target.id];
+		report.push(`  the plates are cut out by clear texels, so they need cutout transparency${cut ? ': ' + cut : ''}`);
+	}
+
 	// The approximation share is the only honest measure of result quality.
 	// Without it the import succeeded even on models that turned out to be almost
 	// entirely wedges and bevels: the project opened, looked like mush, and there
@@ -4474,9 +6265,26 @@ function buildFromFiles(files, sourceName, opts) {
 	// otherwise the GPU cannot decide which face is nearer and the model
 	// flickers. Coordinates stay clean throughout.
 	const wantZFight = !opts || opts.zfight !== false;
+	// Strips stay out of it: flat, with no volume to order them by, they would take
+	// a neighbour's layer. Each lies just above its own plate instead, one step
+	// further out than the one before it — lifted, not inflated, since inflating
+	// would also widen it past its edge.
+	const isStrip = s => !!s.piece && s.piece.kind === 'strip';
+	const layered = solved.filter(s => !isStrip(s));
 	const coplanar = wantZFight
-		? resolveCoplanar(solved.map(s => s.sol))
-		: { inflate: solved.map(() => 0), pairs: 0, capped: 0, skipped: 0 };
+		? resolveCoplanar(layered.map(s => s.sol))
+		: { inflate: layered.map(() => 0), pairs: 0, capped: 0, skipped: 0 };
+	layered.forEach((s, i) => { s.inflate = coplanar.inflate[i] || 0; });
+	if (rebuilt) {
+		const byPiece = new Map(solved.filter(s => s.piece).map(s => [s.piece, s]));
+		for (const s of solved) {
+			if (!isStrip(s)) continue;
+			const owner = byPiece.get(s.piece.owner);
+			const lift = (owner ? owner.inflate : 0) + ROUND.LIFT * s.piece.step;
+			s.sol = { ...s.sol, center: add(s.sol.center, mul(s.piece.owner.box.axes[0], lift)) };
+		}
+	}
+	coplanar.inflate = solved.map(s => s.inflate || 0);
 	if (coplanar.skipped) {
 		report.push(`Coplanar face separation skipped: ${coplanar.skipped} objects — too many`);
 	}
@@ -4493,12 +6301,13 @@ function buildFromFiles(files, sourceName, opts) {
 	// bones are moved by one and the same transform.
 	let pivots = parsed.hierarchy.map(h => h.pivot);
 	if (target.still) {
+		// An added model stays where it was put, and is only pushed back inside.
 		const fit = fitJavaBox(solved.map((s, i) => ({
 			center: s.sol.center, size: s.sol.size, inflate: coplanar.inflate[i],
-		})), !!(opts && opts.recenter));
+		})), !adding && !!(opts && opts.recenter));
 		for (let si = 0; si < solved.length; si++) {
 			const sol = solved[si].sol;
-			solved[si] = { obj: solved[si].obj, sol: { ...sol, center: applyFit(sol.center, fit), size: sol.size.map(v => v * fit.k) } };
+			solved[si] = { ...solved[si], sol: { ...sol, center: applyFit(sol.center, fit), size: sol.size.map(v => v * fit.k) } };
 			coplanar.inflate[si] *= fit.k;
 		}
 		pivots = pivots.map(p => applyFit(p, fit));
@@ -4519,40 +6328,73 @@ function buildFromFiles(files, sourceName, opts) {
 	if (!target.still && !(opts && opts.animations === false)) {
 		for (const a of parsed.animations) for (const ch of a.channels) animatedNodes.add(ch.node);
 	}
+	// GeckoLib and Bedrock tell bones apart by name, so an added model's folders
+	// must not take one the project already has.
+	const taken = adding ? namesIn(Group.all) : new Set();
 	const tidy = opts && opts.keep_hierarchy
 		? null
-		: tidyHierarchy(parsed.hierarchy, solved.map(s => s.obj.node), animatedNodes);
+		: tidyHierarchy(parsed.hierarchy, solved.map(s => s.obj.node), animatedNodes, taken);
 	if (tidy && tidy.removed) {
 		report.push(`Folders: ${tidy.kept.length} of ${parsed.hierarchy.length} kept — the rest held one thing `
 			+ 'or nothing and no animation' + (tidy.stripped ? "; the exporter's _N numbering stripped" : ''));
 	}
+	if (tidy) for (const n of tidy.name.values()) taken.add(n);
+
+	// An added model arrives as one folder, to be moved, hidden or deleted whole:
+	// its own top folder when it has exactly one and nothing loose beside it, or
+	// else a new one named after the model, standing on the attach point.
+	const inHierarchy = new Set(parsed.hierarchy.map(h => h.index));
+	const folderOf = n => (tidy ? tidy.home(n) : inHierarchy.has(n) ? n : -1);
+	const parentOf = h => (tidy ? tidy.parent.get(h.index) : h.parent);
+	const tops = parsed.hierarchy.filter(h => (!tidy || tidy.name.has(h.index)) && !(parentOf(h) >= 0));
+	let holder = null;
+	if (adding && (tops.length !== 1 || solved.some(s => folderOf(s.obj.node) < 0))) {
+		const name = uniqueName(nameSlug(sourceName), taken);
+		taken.add(name);
+		holder = new Group({ name, origin: host.point.slice() }).init();
+		if (host.group) holder.addTo(host.group);
+	}
+	const topParent = holder || (host && host.group) || null;
 
 	// bones: the hierarchy is walked in order, a parent always before its child
 	const groupByNode = {};
 	parsed.hierarchy.forEach((h, i) => {
 		if (tidy && !tidy.name.has(h.index)) return;
-		const g = new Group({ name: tidy ? tidy.name.get(h.index) : h.name, origin: snapVec(pivots[i]) }).init();
-		const p = tidy ? tidy.parent.get(h.index) : h.parent;
+		let name = tidy ? tidy.name.get(h.index) : h.name;
+		if (adding && !tidy) { name = uniqueName(name, taken); taken.add(name); }
+		const g = new Group({ name, origin: snapVec(pivots[i]) }).init();
+		const p = parentOf(h);
 		if (p >= 0 && groupByNode[p]) g.addTo(groupByNode[p]);
+		else if (topParent) g.addTo(topParent);
 		groupByNode[h.index] = g;
 	});
-	const groupCount = Object.keys(groupByNode).length;
+	const groupCount = Object.keys(groupByNode).length + (holder ? 1 : 0);
 
 	let hidden = 0, mirrored = 0, untextured = 0;
 	const cubes = [];
+	const piecesMade = new Map();
 	for (let si = 0; si < solved.length; si++) {
-		const { obj, sol } = solved[si];
-		if (obj.image < 0) untextured++;
-		const name = tidy
+		const { obj, sol, piece } = solved[si];
+		if (obj.image < 0 && !piece) untextured++;
+		let name = tidy
 			? tidy.cubeName(obj.node, obj.baseName || obj.name) + (obj.part ? `_${obj.part}` : '')
 			: obj.name;
+		// a rebuilt part becomes several cubes, numbered after it
+		if (piece) {
+			const k = (piecesMade.get(obj) || 0) + 1;
+			piecesMade.set(obj, k);
+			name += `_${k}`;
+		}
 		const cube = cubeFromSolution(name, sol, atlasTexture.uuid, coplanar.inflate[si]);
-		const parent = groupByNode[tidy ? tidy.home(obj.node) : obj.node];
+		const parent = groupByNode[folderOf(obj.node)] || topParent;
 		if (parent) cube.addTo(parent);
 		cube.init();
 		cubes.push(cube);
-		hidden += sol.emptyFaces.length;
-		mirrored += sol.mirrored ? 1 : 0;
+		// a plate has four sides of no size and a mirrored back by nature
+		if (!piece) {
+			hidden += sol.emptyFaces.length;
+			mirrored += sol.mirrored ? 1 : 0;
+		}
 	}
 
 	// Which Minecraft can show the cubes as turned. Blockbench keys its Java
@@ -4580,18 +6422,49 @@ function buildFromFiles(files, sourceName, opts) {
 		}
 	}
 
+	// How the texture came out: its own size, or where it went in the project's.
+	const sizeText = `${size.width}×${size.height}`;
+	const uvText = s => `${s[0]}×${s[1]}`;
+	const place = adding && host.group ? `the folder “${host.group.name}”` : 'the top level';
+	let texLine = `Texture: ${sizeText}`, texShort = sizeText;
+	if (adding && texKind === 'beside') {
+		const k = baseTexture ? baseTexture.width / oldSize[0] : 1;
+		texLine = `Texture: the model's ${sizeText} drawn beside the project's at [${plan.offset.join(', ')}]; `
+			+ `the UV size grew from ${uvText(oldSize)} to ${uvText(plan.uvSize)}, the UV already made kept`
+			+ (k !== 1 ? `; drawn ×${+k.toFixed(3)} to match the project texture's resolution` : '')
+			+ (baseTexture && baseTexture.path ? '. The project texture now differs from its file: save the texture to write it' : '');
+		texShort = `${uvText(plan.uvSize)}, was ${uvText(oldSize)}`;
+	} else if (adding && texKind !== 'fresh') {
+		texLine = `Texture: ${sizeText}, added as a texture of its own`
+			+ (texKind === 'shared' ? `; its UV fitted to the project's UV size, ${uvText(oldSize)}` : '');
+		texShort = `${sizeText}, added`;
+	}
+
 	const lines = [
 		`Imported from: ${sourceName}`,
-		`Built into: ${target.name}`,
+		adding ? `Added to: the open ${target.name} project, into ${place}` : `Built into: ${target.name}`,
 		// facts gathered before the project existed (scale, textures)
 		...report,
 		`Cubes created: ${solved.length}`,
 		`Bones created: ${groupCount}`,
-		`Texture: ${size.width}×${size.height}`,
+		texLine,
 		`Objects without a material: ${untextured}`,
 		`Faces hidden: ${hidden}`,
 		`Mirrored cubes: ${mirrored}`,
 	];
+	// An added model's animations carry its name in front, so they neither take
+	// nor hide an animation the project already has.
+	let animOpts = opts;
+	if (adding) {
+		const used = namesIn(Animation.all);
+		const renamed = new Map();
+		for (const a of parsed.animations) {
+			const n = uniqueName(`${nameSlug(sourceName)}.${a.name}`, used);
+			used.add(n);
+			renamed.set(a.name, n);
+		}
+		animOpts = { ...opts, animName: n => renamed.get(n) || n };
+	}
 	// A failure in animations must not bring down the whole import: cubes and
 	// texture are already built, and losing them over animations makes no sense.
 	if (target.still) {
@@ -4600,7 +6473,7 @@ function buildFromFiles(files, sourceName, opts) {
 		}
 	} else {
 		try {
-			applyAnimations(parsed, groupByNode, lines, opts);
+			applyAnimations(parsed, groupByNode, lines, animOpts);
 		} catch (e) {
 			console.error('[gltf-to-minecraft] animation transfer failed', e);
 			lines.push('', `ANIMATIONS WERE NOT TRANSFERRED: ${(e && e.message) || e}`,
@@ -4611,6 +6484,23 @@ function buildFromFiles(files, sourceName, opts) {
 	lines.push('', calibration);
 
 	Canvas.updateAll();
+	if (adding) {
+		// Selected, so it can be moved into place right away.
+		const handle = holder || (tops.length && groupByNode[tops[0].index]);
+		try { if (handle && handle.select) handle.select(); } catch (e) { /* only a convenience */ }
+		const added = Animation.all.filter(a => !animsBefore.has(a));
+		const finish = () => {
+			try {
+				Undo.finishEdit('Import glTF model', {
+					elements: cubes, outliner: true, textures: [atlasTexture], bitmap: true,
+					uv_mode: true, animations: added, selection: true,
+				});
+			} catch (e) {
+				console.error('[gltf-to-minecraft] the import could not be recorded for undo', e);
+			}
+		};
+		texReady.then(finish, finish);
+	}
 	console.log('[gltf-to-minecraft] import\n' + lines.join('\n'));
 	// Everything worked out along the way is handed back: the CPM branch needs the
 	// very same hierarchy, boxes and texture, and re-deriving them would mean a
@@ -4621,22 +6511,31 @@ function buildFromFiles(files, sourceName, opts) {
 		needAtlas,
 		// the CPM dialog and file name bones and cubes the way the outliner does
 		tidy,
+		rebuilt,
+		// the baked sheets, for anything that draws the atlas again
+		sheets: sheetList,
 	};
 	showImportReport({
 		title: 'Import finished',
 		summary: [
 			['Format', target.name],
+		].concat(adding ? [['Added to', place.replace(/^the /, '')]] : [], [
 			['Cubes', String(solved.length)],
 			['Bones', String(groupCount)],
-			['Texture', `${size.width}×${size.height}`],
-			['Animations', target.still ? 'none, the model is still' : String(parsed.animations.length)],
+			['Texture', texShort],
+			['Animations', target.still ? 'none, the model is still'
+				: opts && opts.animations === false && parsed.animations.length ? `${parsed.animations.length}, left out`
+					: String(parsed.animations.length)],
 			['Scale', `×${chosenScale}`],
-		].concat(approximated
+		], approximated
 			? [['Approximated', `${approximated} of ${solved.length} (${approxShare}%)`]]
+			: [], rebuilt
+			? [['Rebuilt', `${rebuilt.stats.parts} parts → ${rebuilt.pieces.length - unsolved} cubes (${rebuildMode === 'best' ? 'best quality' : 'fast'})`]]
 			: []),
-		warning: approxShare >= 30
-			? 'This model is mostly not cube-based: wedges and bevels became boxes, so shape was lost.'
-			: null,
+		warning: [
+			approxShare >= 30 ? 'This model is mostly not cube-based: wedges and bevels became boxes, so shape was lost.' : null,
+			lostMaterials,
+		].filter(Boolean),
 		log: lines.join('\n'),
 		name: (sourceName || 'model').replace(/\.[^.]*$/, ''),
 	});
@@ -4675,7 +6574,7 @@ function showImportReport(info) {
 			+ '.mtc_rep_bar { display: flex; gap: 8px; align-items: center; margin-top: 10px; }'
 			+ '</style>'
 			+ `<div class="mtc_rep_grid">${rows}</div>`
-			+ (info.warning ? `<div class="mtc_rep_warn">${esc(info.warning)}</div>` : '')
+			+ [].concat(info.warning || []).map(w => `<div class="mtc_rep_warn">${esc(w)}</div>`).join('')
 			+ '<details><summary style="cursor:pointer;margin-bottom:8px">Import details</summary>'
 			+ `<div class="mtc_rep_log">${esc(info.log)}</div>`
 			+ '<div class="mtc_rep_bar">'
@@ -4736,8 +6635,20 @@ function sketchfabToken(value) {
 }
 
 /** Model search. No token needed — the endpoint is public. */
-function sketchfabSearch(query, blockbenchOnly, animatedOnly) {
-	return sketchfabFetchPage(sketchfabSearchURL(query, blockbenchOnly, animatedOnly));
+function sketchfabSearch(query, blockbenchOnly, animatedOnly, sort) {
+	return sketchfabFetchPage(sketchfabSearchURL(query, blockbenchOnly, animatedOnly, sort));
+}
+
+/** The order last chosen in the search, kept between openings of the browser. */
+const SKETCHFAB_SORT_KEY = PLUGIN_ID + '_sketchfab_sort';
+function sketchfabSort(value) {
+	try {
+		if (value !== undefined) localStorage.setItem(SKETCHFAB_SORT_KEY, value);
+		const saved = localStorage.getItem(SKETCHFAB_SORT_KEY) || '';
+		return SKETCHFAB_SORTS.some(o => o.id === saved) ? saved : '';
+	} catch (e) {
+		return value || '';
+	}
 }
 
 /** Loads a page of results. The `next` field already holds a ready URL. */
@@ -4748,59 +6659,34 @@ function sketchfabFetchPage(url) {
 	});
 }
 
-/**
- * Downloads a model and returns the unpacked files.
- *
- * The archive link is temporary, so it is fetched immediately. Its layout is
- * exactly what the import already parses: scene.gltf, scene.bin, textures/.
- */
-function sketchfabDownload(uid, onProgress) {
-	const token = sketchfabToken();
-	if (!token) return Promise.reject(new Error('no API token set'));
-
-	onProgress && onProgress('requesting link…');
-	return fetch(SKETCHFAB_API + '/models/' + uid + '/download', {
-		headers: { Authorization: 'Token ' + token },
-	}).then(r => {
-		if (r.status === 401) throw new Error('token rejected (401)');
-		if (r.status === 403) throw new Error('no permission to download this model (403)');
-		if (!r.ok) throw new Error('HTTP ' + r.status);
-		return r.json();
-	}).then(info => {
-		const src = info.gltf || info.glb;
-		if (!src || !src.url) throw new Error('the response has no glTF link');
-		onProgress && onProgress('downloading archive…');
-		return fetch(src.url);
-	}).then(r => {
-		if (!r.ok) throw new Error('archive returned HTTP ' + r.status);
-		return r.arrayBuffer();
-	}).then(buf => {
-		onProgress && onProgress('unpacking…');
-		return JSZip.loadAsync(buf);
-	}).then(zip => {
-		const entries = {};
-		const tasks = [];
-		zip.forEach((relPath, entry) => {
-			if (entry.dir) return;
-			tasks.push(entry.async('uint8array').then(data => { entries[relPath] = data; }));
-		});
-		return Promise.all(tasks).then(() => entries);
-	});
-}
-
 /** Browser styles: custom markup does not inherit Blockbench styling. */
 let sketchfabCSS = null;
 function addSketchfabStyles() {
 	if (sketchfabCSS || typeof Blockbench.addCSS !== 'function') return;
 	sketchfabCSS = Blockbench.addCSS(`
 		.mtc_sf_bar { display: flex; gap: 6px; margin-bottom: 8px; }
-		.mtc_sf_bar input[type="text"] { flex: 1; }
+		.mtc_sf_bar input[type="text"] { flex: 1 1 auto; min-width: 90px; width: 0; }
+		.mtc_sf_bar > button, .mtc_sf_bar > label { flex: none; }
+		/* sized to its longest option: squeezed by the flex row it read "Most l" */
+		.mtc_sf_sort { display: flex; flex: none; }
+		.mtc_sf_sort .bb-select { width: auto; min-width: 116px; margin: 0; }
+		.mtc_sf_sort select { width: auto; }
 		.mtc_sf_only { display: flex; align-items: center; gap: 4px; white-space: nowrap; cursor: pointer; }
 		.mtc_sf_status { margin: 4px 0; opacity: 0.8; min-height: 18px; }
 		.mtc_sf_results { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
 			gap: 8px; max-height: 380px; overflow-y: auto; }
 		.mtc_sf_card { border: 1px solid var(--color-border); border-radius: 4px;
-			padding: 4px; cursor: pointer; font-size: 11px; }
+			padding: 4px; cursor: pointer; font-size: 11px; position: relative; }
+		.mtc_sf_look { position: absolute; top: 8px; right: 8px; min-width: 0; height: 28px; padding: 0 4px;
+			display: flex; align-items: center; background: rgba(0, 0, 0, 0.55); color: #fff;
+			border: none; border-radius: 4px; cursor: pointer; }
+		.mtc_sf_look:hover { background: var(--color-accent); }
+		.mtc_sf_look i { font-size: 20px; }
+		.mtc_sf_preview { display: flex; flex-direction: column; gap: 6px; }
+		.mtc_sf_pbar { display: flex; gap: 6px; align-items: center; }
+		.mtc_sf_ptitle { flex: 1; font-weight: bold; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+		.mtc_sf_preview iframe { width: 100%; height: 380px; border: none; border-radius: 4px;
+			background: var(--color-back); }
 		.mtc_sf_card:hover { background-color: var(--color-selected); }
 		.mtc_sf_card.mtc_sf_busy { opacity: 0.5; cursor: progress; }
 		.mtc_sf_card img { width: 100%; aspect-ratio: 16/9; object-fit: cover; border-radius: 2px;
@@ -4837,7 +6723,7 @@ function openSketchfabBrowser() {
 	const dialog = new Dialog({
 		id: PLUGIN_ID + '_sketchfab',
 		title: 'Sketchfab — model search',
-		width: 760,
+		width: 800,
 		lines: [
 			'<div class="mtc_sf_bar">'
 			+ '<input type="text" class="dark_bordered mtc_sf_query" placeholder="search for, e.g.: dwarf house">'
@@ -4848,11 +6734,23 @@ function openSketchfabBrowser() {
 			+ '<input type="checkbox" class="mtc_sf_bb" checked> Made in Blockbench</label>'
 			+ '<label class="mtc_sf_only" title="Only models with at least one animation">'
 			+ '<input type="checkbox" class="mtc_sf_anim"> Animated</label>'
+			// the order's drop-down is put in here once the dialog exists
+			+ '<span class="mtc_sf_sort" title="Order of the results. Sketchfab has no order by downloads"></span>'
 			+ '<button class="mtc_sf_find">Search</button>'
 			+ '<button class="mtc_sf_token">Token…</button>'
 			+ '</div>'
 			+ '<div class="mtc_sf_status"></div>'
-			+ '<div class="mtc_sf_results"></div>',
+			+ '<div class="mtc_sf_results"></div>'
+			// A model looked at in Sketchfab's own viewer, in place of the results.
+			+ '<div class="mtc_sf_preview" style="display: none">'
+			+ '<div class="mtc_sf_pbar">'
+			+ '<button class="mtc_sf_back"><i class="material-icons">arrow_back</i> Results</button>'
+			+ '<span class="mtc_sf_ptitle"></span>'
+			+ '<button class="mtc_sf_page">Open on Sketchfab</button>'
+			+ '<button class="mtc_sf_pimport">Import</button>'
+			+ '</div>'
+			+ '<div class="mtc_sf_frame"></div>'
+			+ '</div>',
 		],
 		singleButton: true,
 	});
@@ -4904,22 +6802,73 @@ function openSketchfabBrowser() {
 		// dialog that follows, and three of the four come with Blockbench. If the
 		// one chosen is missing, that dialog stays open with the download in hand.
 		say('preparing ' + model.name + '…');
-		sketchfabDownload(model.uid, say)
-			.then(entries => {
+		sketchfabDownload(model.uid, sketchfabToken(), say)
+			.then(({ entries, original }) => {
 				release();
 				say('unpacked, asking for settings…');
 				dialog.hide();
 				askImportOptions(opts => {
-					const built = buildFromFiles(entries, model.name || 'sketchfab', opts);
 					// attribution is always printed, even without a license.txt in the archive
 					console.log('[gltf-to-minecraft] Sketchfab: «' + model.name + '» — '
 						+ ((model.user && model.user.displayName) || '?') + ', '
-						+ ((model.license && model.license.label) || 'licence not stated'));
-					return built;
+						+ ((model.license && model.license.label) || 'licence not stated')
+						+ (original ? ', the author\'s original' : ''));
+					const settings = original ? Object.assign({}, opts, { original: true }) : opts;
+					return buildFromFiles(entries, model.name || 'sketchfab', settings).catch(e => {
+						console.error('[gltf-to-minecraft] import failed', e);
+						Blockbench.showMessageBox({ title: 'Import failed', message: String((e && e.message) || e) });
+					});
 				});
 			})
 			.catch(e => { release(); say('failed: ' + ((e && e.message) || e)); });
 	};
+
+	// Looking before downloading: Sketchfab's own viewer, turned and played right
+	// here in place of the results. A click on a card still imports at once; the
+	// 3D button on its picture opens this instead.
+	const preview = root.querySelector('.mtc_sf_preview');
+	const frame = root.querySelector('.mtc_sf_frame');
+	let previewed = null;
+	// what the status said over the results, to say again on the way back
+	let statusBefore = '';
+	const closePreview = () => {
+		if (!previewed) return;
+		previewed = null;
+		say(statusBefore);
+		// the viewer goes with its frame, so a closed preview stops drawing
+		if (frame) frame.innerHTML = '';
+		if (preview) preview.style.display = 'none';
+		if (results) results.style.display = '';
+	};
+	const openPreview = (model, card) => {
+		const src = sketchfabEmbedURL(model.uid);
+		if (!src || !preview || !frame || !results) return;
+		closePreview();
+		statusBefore = status ? status.textContent : '';
+		previewed = { model, card };
+		results.style.display = 'none';
+		preview.style.display = '';
+		const title = root.querySelector('.mtc_sf_ptitle');
+		if (title) title.textContent = (model.name || '') + (model.user && model.user.displayName ? ' — ' + model.user.displayName : '');
+		const iframe = document.createElement('iframe');
+		iframe.setAttribute('allow', 'autoplay; fullscreen; xr-spatial-tracking');
+		iframe.setAttribute('allowfullscreen', '');
+		iframe.src = src;
+		frame.appendChild(iframe);
+		say((model.license && model.license.label ? 'licence: ' + model.license.label + ' · ' : '')
+			+ 'drag to turn it; Import downloads it');
+	};
+	const onClick = (selector, fn) => {
+		const el = root.querySelector(selector);
+		if (el) el.addEventListener('click', fn);
+	};
+	onClick('.mtc_sf_back', closePreview);
+	onClick('.mtc_sf_page', () => {
+		const url = previewed && sketchfabPageURL(previewed.model);
+		if (!url) return;
+		if (Blockbench.openLink) Blockbench.openLink(url); else window.open(url);
+	});
+	onClick('.mtc_sf_pimport', () => { if (previewed) importModel(previewed.model, previewed.card); });
 
 	let nextUrl = null;
 	let shown = 0;
@@ -4954,8 +6903,11 @@ function openSketchfabBrowser() {
 			const card = document.createElement('div');
 			card.className = 'mtc_sf_card';
 			const NL = String.fromCharCode(10);
+			const likes = Number(m.likeCount) || 0;
 			card.title = (m.name || '') + NL + 'Author: ' + ((m.user && m.user.displayName) || '?')
-				+ NL + 'Licence: ' + ((m.license && m.license.label) || '?');
+				+ NL + 'Licence: ' + ((m.license && m.license.label) || '?')
+				+ NL + `Likes: ${likes}, views: ${Number(m.viewCount) || 0}`
+				+ (m.publishedAt ? NL + 'Published: ' + String(m.publishedAt).slice(0, 10) : '');
 			const kb = m.archives && m.archives.gltf ? Math.round(m.archives.gltf.size / 1024) : null;
 			// Triangles and animations as icons with a number, the meaning in the
 			// tooltip: both come with the search results, and both say more about
@@ -4969,6 +6921,10 @@ function openSketchfabBrowser() {
 			const count = n => n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : String(n);
 			card.innerHTML =
 				(thumb ? '<img src="' + thumb.url + '">' : '<img>')
+				+ (sketchfabEmbedURL(m.uid)
+					? '<button class="mtc_sf_look" title="Look at it in 3D before downloading">'
+						+ '<i class="material-icons">3d_rotation</i></button>'
+					: '')
 				+ '<div class="mtc_sf_name"></div>'
 				+ '<div class="mtc_sf_meta mtc_sf_author"></div>'
 				+ '<div class="mtc_sf_meta mtc_sf_lic"></div>'
@@ -4976,6 +6932,8 @@ function openSketchfabBrowser() {
 				+ `<span title="Triangles: ${tris}"><i class="material-icons">change_history</i>${count(tris)}</span>`
 				+ `<span title="Animations: ${anims}"${anims ? '' : ' class="mtc_sf_none"'}>`
 				+ `<i class="material-icons">animation</i>${anims}</span>`
+				+ `<span title="Likes: ${likes}"${likes ? '' : ' class="mtc_sf_none"'}>`
+				+ `<i class="material-icons">favorite</i>${count(likes)}</span>`
 				+ (hint === 'cubes'
 					? '<span title="Built from separate cubes: it should convert whole">'
 						+ '<i class="material-icons">view_in_ar</i></span>'
@@ -4991,6 +6949,8 @@ function openSketchfabBrowser() {
 			card.querySelector('.mtc_sf_lic').textContent =
 				((m.license && m.license.label) || '') + (kb ? ' · ' + (kb > 1024 ? (kb / 1024).toFixed(1) + ' MB' : kb + ' KB') : '');
 			card.addEventListener('click', () => importModel(m, card));
+			const look = card.querySelector('.mtc_sf_look');
+			if (look) look.addEventListener('click', e => { e.stopPropagation(); openPreview(m, card); });
 			results.appendChild(card);
 		}
 		// the more button stays the last tile so the grid is not broken
@@ -5014,13 +6974,44 @@ function openSketchfabBrowser() {
 
 	const onlyBB = root.querySelector('.mtc_sf_bb');
 	const onlyAnimated = root.querySelector('.mtc_sf_anim');
+	let sort = sketchfabSort();
 	let searched = false;
 	const doSearch = () => {
 		searched = true;
+		closePreview();
 		say('searching…');
-		sketchfabSearch(q ? q.value : '', !onlyBB || onlyBB.checked, !!onlyAnimated && onlyAnimated.checked)
+		sketchfabSearch(q ? q.value : '', !onlyBB || onlyBB.checked, !!onlyAnimated && onlyAnimated.checked, sort)
 			.then(render).catch(e => say('search error: ' + ((e && e.message) || e)));
 	};
+
+	// The order, as Blockbench's own drop-down: the one its dialogs use, opening
+	// its own menu. A plain <select> opened the system's list, which looked like
+	// nothing else in Blockbench. A build without it gets the plain one still.
+	const sortSlot = root.querySelector('.mtc_sf_sort');
+	const pickSort = value => {
+		sort = SKETCHFAB_SORTS.some(o => o.id === value) ? value : '';
+		sketchfabSort(sort);
+		if (searched) doSearch();
+	};
+	if (sortSlot) {
+		// the empty id of Relevance would read as "nothing chosen" to the drop-down
+		const keyOf = id => id || 'relevance';
+		let node = null;
+		try {
+			const options = {};
+			for (const o of SKETCHFAB_SORTS) options[keyOf(o.id)] = o.label;
+			node = new Interface.CustomElements.SelectInput(PLUGIN_ID + '_sf_sort', {
+				options, value: keyOf(sort),
+				onChange: key => pickSort(key === 'relevance' ? '' : key),
+			}).node;
+		} catch (e) {
+			node = document.createElement('select');
+			node.className = 'dark_bordered';
+			for (const o of SKETCHFAB_SORTS) node.add(new Option(o.label, o.id, false, o.id === sort));
+			node.addEventListener('change', () => pickSort(node.value));
+		}
+		sortSlot.appendChild(node);
+	}
 
 	if (root.querySelector('.mtc_sf_find')) root.querySelector('.mtc_sf_find').addEventListener('click', doSearch);
 	// Flipping the filter over results already on screen redoes the search:
@@ -5085,6 +7076,27 @@ function defaultTarget() {
 }
 
 /**
+ * What adding to the open project will do, said in the dialog before it is done:
+ * where the model goes, and what becomes of its texture.
+ */
+function describeAdding(target) {
+	const esc = s => String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+	const host = attachPoint();
+	const where = host.group
+		? `Goes into the selected folder “${esc(host.group.name)}”, standing on its pivot.`
+		: 'Goes to the top level. To put it in a folder, a hand for instance, select that folder before importing.';
+	let texture = 'Its texture is added as a texture of its own.';
+	try {
+		const empty = !Texture.all.length && !((typeof Outliner !== 'undefined' && Outliner.elements) || []).length;
+		if (!empty && Format.single_texture) {
+			texture = `A ${target.name} model has one texture, so the model's is drawn beside it, `
+				+ 'and the sheet grows to hold both. The UV already made stay as they are.';
+		}
+	} catch (e) { /* the general line stands */ }
+	return `${where} ${texture} Ctrl+Z takes the whole import back.`;
+}
+
+/**
  * Asks for the import settings.
  *
  * Kept separate: the same dialog serves both the file import and downloads from
@@ -5094,9 +7106,15 @@ function defaultTarget() {
 function askImportOptions(onReady, fixedTarget) {
 	// Visibility rule: advanced fields appear once the checkbox is ticked.
 	const adv = form => !!form.advanced;
+	// Adding to the open project is offered when one is open in a format the
+	// import builds into, and never to the CPM export, which needs its own.
+	const open = fixedTarget ? null : openProjectTarget();
+	const adding = form => !!(open && form.add_to_open);
 	// Java models do not animate, so the animation levers hide for them.
-	const animated = form => (fixedTarget || form.target) !== 'java_block';
+	const animated = form => (fixedTarget || (adding(form) ? open.id : form.target)) !== 'java_block';
 	const advAnim = form => adv(form) && animated(form);
+	// The rebuild's two ways show while the rebuild is what happens to such parts.
+	const rebuilding = form => (form.bad_objects || 'rebuild') === 'rebuild';
 
 	// GeckoLib is offered even when it is not installed, so the choice leads
 	// somewhere: to the plugin that provides it.
@@ -5110,12 +7128,17 @@ function askImportOptions(onReady, fixedTarget) {
 		targetOptions[t.id] = t.id === 'geckolib_model' && !hasGeckolib ? 'GeckoLib (no plugin)' : t.name;
 	}
 	const targetFields = fixedTarget ? {} : {
-		target: { label: 'Build into', type: 'select', default: defaultTarget(), options: targetOptions },
+		...(open ? {
+			add_to_open: { label: 'Add to the open project', type: 'checkbox', value: false },
+			about_open: { type: 'info', condition: adding, text: describeAdding(open) },
+		} : {}),
+		target: { label: 'Build into', type: 'select', default: defaultTarget(), options: targetOptions,
+			condition: form => !adding(form) },
 	};
 	if (!fixedTarget) {
 		for (const t of TARGETS) {
 			targetFields['about_' + t.id] = {
-				type: 'info', condition: form => form.target === t.id,
+				type: 'info', condition: form => !adding(form) && form.target === t.id,
 				text: t.id === 'geckolib_model' && !hasGeckolib
 					? 'The GeckoLib plugin is not installed. Choose this anyway and the import '
 						+ 'will show which plugin to get and where.'
@@ -5145,7 +7168,31 @@ function askImportOptions(onReady, fixedTarget) {
 				label: 'Extra rotation around Y', type: 'select', default: '0',
 				options: { 0: 'none', 90: '90°', 180: '180° (faces backwards)', 270: '270°' },
 			},
-			animations: { label: 'Transfer animations', type: 'checkbox', value: true, condition: animated },
+			animations: { label: 'Transfer animations', type: 'checkbox', value: true,
+				condition: form => animated(form) && !adding(form) },
+			// Off when adding: the project has animations of its own, and a sword
+			// rarely needs the ones it was shown off with on Sketchfab.
+			add_animations: { label: 'Add its animations too', type: 'checkbox', value: false,
+				condition: form => animated(form) && adding(form) },
+			// Most models are cubes throughout and never reach this. For the ones with
+			// bevels and rounded shapes it decides how they look, so it sits here and
+			// not among the levers below; the wait each way costs is said under it.
+			rounded: {
+				label: 'Rounded parts', type: 'select', default: 'fast', condition: rebuilding,
+				options: { fast: 'Fast', best: 'Best quality (slow)' },
+			},
+			about_rounded_fast: {
+				type: 'info', condition: form => rebuilding(form) && form.rounded !== 'best',
+				text: 'Parts that are not cubes (bevels, wedges, rounded shapes) are rebuilt from thin plates '
+					+ 'that follow their surface, each cut to its outline by a baked texture. Slanted edges show '
+					+ 'fine steps up close. Takes seconds on most models.',
+			},
+			about_rounded_best: {
+				type: 'info', condition: form => rebuilding(form) && form.rounded === 'best',
+				text: 'Also lays a thin strip along each sharp slanted edge, so edges come out straight. For when '
+					+ 'the look matters more than the wait: 1.5 to 2 times the cubes, a somewhat larger texture, '
+					+ 'and on big models an import of a minute or more. It can be finished early from its window.',
+			},
 
 			advanced: { label: 'Advanced settings', type: 'checkbox', value: false },
 
@@ -5160,8 +7207,9 @@ function askImportOptions(onReady, fixedTarget) {
 				value: 0, min: 0, max: 64, step: 0.05, condition: adv,
 			},
 			bad_objects: {
-				label: 'Objects that are not cubes', type: 'select', default: 'box', condition: adv,
+				label: 'Objects that are not cubes', type: 'select', default: 'rebuild', condition: adv,
 				options: {
+					rebuild: 'Rebuild them (Rounded parts)',
 					box: 'Approximate with a bounding box',
 					skip: 'Skip them',
 					abort: 'Cancel the import',
@@ -5208,6 +7256,10 @@ function askImportOptions(onReady, fixedTarget) {
 		onConfirm(form) {
 			if (fixedTarget) {
 				form.target = fixedTarget;
+			} else if (adding(form)) {
+				// The project's format, and the remembered choice left alone.
+				form.target = open.id;
+				form.animations = !!form.add_animations;
 			} else {
 				try { localStorage.setItem(TARGET_KEY, form.target); } catch (e) { /* only a convenience */ }
 				// The dialog stays open behind the message, so another format can be
@@ -5671,7 +7723,8 @@ function cpmSkinBytes(built) {
 	if (!built.needAtlas && built.images.length === 1 && built.images[0].mime === 'image/png') {
 		return Promise.resolve(built.images[0].bytes);
 	}
-	return buildAtlasDataURL(built.images, built.layout).then(url => {
+	// the rebuilt parts' sheets are in the atlas too, after the pictures
+	return buildAtlasDataURL(built.images, built.layout, built.sheets).then(url => {
 		if (!url) throw new Error('the texture could not be assembled');
 		return base64ToBytes(url.slice(url.indexOf(',') + 1));
 	});
@@ -5720,10 +7773,9 @@ function pickAndImport(opts, then) {
 					if (entry.dir) return;
 					tasks.push(entry.async('uint8array').then(data => { entries[relPath] = data; }));
 				});
-				return Promise.all(tasks).then(() => {
-					const built = buildFromFiles(entries, archive.name, opts);
-					if (then) then(built);
-				});
+				return Promise.all(tasks)
+					.then(() => buildFromFiles(entries, archive.name, opts))
+					.then(built => { if (then) then(built); });
 			}).catch(fail);
 			return;
 		}
@@ -5747,10 +7799,9 @@ function pickAndImport(opts, then) {
 			});
 			return;
 		}
-		try {
-			const built = buildFromFiles(entries, modelName, opts);
-			if (then) then(built);
-		} catch (e) { fail(e); }
+		buildFromFiles(entries, modelName, opts)
+			.then(built => { if (then) then(built); })
+			.catch(fail);
 	});
 }
 
@@ -5891,9 +7942,11 @@ let cpmAction;
 Plugin.register(PLUGIN_ID, {
 	title: 'glTF to Minecraft',
 	author: 'MopicMP',
-	icon: 'view_in_ar',
+	// beside this file: Blockbench looks for it next to the plugin, and the
+	// catalog in the plugin's folder
+	icon: 'icon.png',
 	description: 'Convert glTF models — from an archive, a folder or straight from Sketchfab — into cubes Minecraft can use: GeckoLib and Bedrock models with bones and animations, still Java block and item models, or Customizable Player Models skins.',
-	version: '0.2.0',
+	version: '0.1.3',
 	variant: 'both',
 	min_version: '4.9.0',
 	has_changelog: true,

@@ -48,6 +48,21 @@ dropped; an axis conversion (a multiple of 90°) is kept. Dropping both used to
 make models arrive lying down. Extra rotation around X and Y is available in the
 dialog for the cases a file cannot settle.
 
+**Materials.** A material's colour texture is its `baseColorTexture`, or, in the
+specular-glossiness workflow, the `diffuseTexture` inside that extension. Read
+only in the first place, such a file looked textureless, and every part fell back
+to the first picture. Normal, roughness and similar maps stay out of the atlas.
+
+**Outline shells.** A toon outline is often a copy of a part, a little larger,
+turned inside out and on a one-sided dark material: a viewer that culls back faces
+draws only its far side, which peeks out around the part as a rim. Minecraft and
+Blockbench draw cubes from both sides, so the same shell would arrive as a dark
+casing over the part. A piece whose faces are all on one-sided materials, closed
+(at most one edge in twenty unpaired) and wound inward — a negative signed volume,
+read the other way round under a mirroring transform, as glTF itself does — is
+left out, and the report counts them. Inside-out parts on two-sided materials stay:
+there the winding means nothing.
+
 ## 2. From meshes to cubes
 
 **Merged meshes** are split into connected components first: many exporters emit
@@ -66,9 +81,10 @@ Two float32 traps are avoided on purpose:
   of a short edge is pure noise.
 
 **Degenerate fragments** are dropped. **Objects that are not boxes** — wedges,
-bevels, rounded shapes — are replaced with their bounding box, with the texture
-laid out per face. The report states the approximated share; at 30% or more it
-says the model is a poor fit.
+bevels, rounded shapes — are rebuilt from plates, see
+[section 9](#9-parts-that-are-not-boxes). The advanced settings can instead replace
+each with its bounding box, with the texture laid out per face, skip them, or
+cancel the import; the report lists them either way.
 
 ## 3. Texture layout
 
@@ -112,7 +128,10 @@ conversion makes of them, is left out.
 **Lost alpha.** A Minecraft-style figure has an outer shell that is transparent
 wherever it is unused. If the texture has no alpha channel while the material
 asks for transparency (`alphaMode` `BLEND` or `MASK`), that shell becomes a solid
-slab and hides the body. The channel cannot be recovered, so the report says so.
+slab and hides the body. The report names the mismatch rather than calling it a
+loss: some models ask for transparency on a texture that never had any. Guessing
+a transparent colour was tried and left out — in the downloads that lost alpha it
+became black, and black is also outlines and dark details.
 
 ## 4. Coordinates
 
@@ -218,3 +237,96 @@ follow from the format:
   old to write free rotations says how many cubes it will snap.
 
 Both are checked in [`tools/verify-java-fit.mjs`](../tools/verify-java-fit.mjs).
+
+## 8. Adding to the open project
+
+With *Add to the open project* the model goes into the project that is open,
+in that project's format, instead of a new one. The conversion is the same; what
+changes is where things land and what they are called.
+
+**Where.** Into the selected folder, or the folder of the selected cube, standing
+on that folder's pivot: the model's origin — its bottom centre with centring on —
+is put there, and a sword in a hand turns with the hand. With nothing selected it
+goes to the top level. It arrives as one folder, to be moved, hidden or deleted
+whole: its own top folder when it has exactly one and nothing loose beside it,
+otherwise a new folder named after the file. A Java model is only pushed back
+inside the −16…32 box, not re-centred on the block.
+
+**Names.** GeckoLib and Bedrock tell bones apart by name, so the tidied folder
+names are made unique against the project's before any folder is created, the
+same way repeats inside one model get `_2`, `_3`. Animations are left out unless
+asked for: the project has its own, and a model seldom needs the ones it was
+shown off with. Added ones are named `model.name`, after the file.
+
+**Texture.** How it joins depends on what the format allows:
+
+- **One texture per model** (GeckoLib, Bedrock). The atlas is drawn beside the
+  project texture or under it, whichever leaves the smaller sheet, the squarer on
+  a tie, and the project's UV size grows to match. UV count pixels from the top
+  left, so the old picture keeps its corner and every UV already made reads the
+  same pixels. The sheet is drawn at the old texture's own resolution: a 64×64 UV
+  space painted at 128×128 gets the atlas doubled. A project with cubes but no
+  texture gets a new sheet with the same room left for their UV.
+- **A UV size per texture** (Generic). The atlas becomes a texture of its own
+  with its own UV size; nothing already there changes.
+- **One UV size for every texture** (Java). The atlas becomes a texture of its
+  own, and its UV are scaled into the project's UV size — Minecraft stretches
+  every texture over that size anyway.
+
+An empty project takes the model's UV size, as a new one would.
+
+Three kinds of project texture are refused before anything is built, with the
+project untouched: one with layers, because the redraw would merge them; an
+animated one, whose frames the sheet would break; and one that never loaded,
+which would be replaced with an empty sheet.
+
+**Undo.** Everything the import adds or changes — cubes, folders, animations, the
+texture and the UV size — is one undo step. It is closed only once the texture
+has its pixels: they are drawn after the images decode, and closing earlier would
+record an empty texture, so undoing and redoing would leave one.
+
+The placement, the names and the undo step run through
+[`tools/smoke-plugin.mjs`](../tools/smoke-plugin.mjs) on projects of every format;
+the layout arithmetic is in
+[`tools/verify-add-to-project.mjs`](../tools/verify-add-to-project.mjs).
+
+## 9. Parts that are not boxes
+
+Artists round a shape in Blockbench with many turned cubes laid over each other,
+not with a staircase of straight ones, and that is what the rebuild makes. All
+distances below are model pixels.
+
+**Shape.** A part that one box follows within 0.1 px both ways stays that box:
+most deformed cubes do, and a box is one cube where plates would be six.
+Otherwise its triangles are gathered into near-flat regions — corners within
+0.15 px of the region's plane, each turned less than 5° from it.
+
+**Plates.** Each region becomes a plate: a turned box a hair thick, lying on the
+region, whose front wears a texture baked from the source. The texel of the baked
+sheets is the finest of 1/8, 1/4, 1/2 and 1 px whose total, the file's own boxes
+included, stays within 4 million texels — one 2048² sheet. A texel shows while its
+centre lies within 0.35 texel of the region's outline, otherwise a thin sliver
+between texel centres would vanish; the rest is clear, so the plates are cut out
+by transparency and need a cutout material where the model is used.
+
+**Strips** (*Best quality*). Along a slanted edge at least 1 px long, where the
+surface turns 30° or more or ends, a strip 1.5 texels wide stands on the edge,
+lifted along the normal so its outer edge falls on its own texel border and comes
+out straight. Each strip lies 0.006 px further out than the one before it on its
+plate, so strips crossing at a corner do not flicker. It takes 1.5 to 2 times the
+cubes.
+
+**Culling.** Plates and strips overlap, and many lie inside the model. The model
+is drawn from 114 directions at 840 px across; a piece that covers fewer than 4
+pixels from every one of them is left out. Only pieces that move together are
+weighed against each other — what an animation could reveal stays — and the
+file's own cubes are never left out; they are drawn with their texture's
+transparency, so what shows through them counts as seen.
+
+**Progress.** The rebuild runs in steps and shows how far it has gone. *Finish
+now* keeps what is done and hurries the rest: the parts left get no strips, and
+nothing is culled. *Cancel import* leaves the project as it was.
+
+The pieces are covered by [`tools/verify-rounded.mjs`](../tools/verify-rounded.mjs)
+— a prism, a near-box, the texel budget, culling, finishing early and cancelling —
+and the whole path by [`tools/smoke-plugin.mjs`](../tools/smoke-plugin.mjs).

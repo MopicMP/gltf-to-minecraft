@@ -140,8 +140,10 @@ function cubeGLTF(materialOfFace, splitBlank) {
 	const floats = [];
 	const views = [], accessors = [];
 	for (const quad of corners) {
-		const pos = [0, 1, 2, 0, 2, 3].map(i => quad[i]);
-		const uv = [0, 1, 2, 0, 2, 3].map(i => uvq[i]);
+		// wound outward, as an exporter writes a cube: inward on a one-sided
+		// material it would read as an outline shell and be left out
+		const pos = [0, 2, 1, 0, 3, 2].map(i => quad[i]);
+		const uv = [0, 2, 1, 0, 3, 2].map(i => uvq[i]);
 		for (const [kind, list, type] of [['p', pos, 'VEC3'], ['t', uv, 'VEC2']]) {
 			const offset = floats.length * 4;
 			for (const v of list) floats.push(...v);

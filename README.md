@@ -39,6 +39,21 @@ does that conversion, and everything around it.
 - **Customizable Player Models** are a second target: the same import, saved as a
   `.cpmproject`.
 
+## Installation
+
+**From the plugin list** — in Blockbench, *File → Plugins…*, the *Available* tab,
+search for **glTF to Minecraft** and press *Install*. Updates arrive the same
+way. The list takes a new version a little after it appears here.
+
+**From this repository** — *File → Plugins…*, then *Load Plugin from URL* with
+
+```
+https://raw.githubusercontent.com/MopicMP/gltf-to-minecraft/main/plugin/gltf_to_minecraft.js
+```
+
+or download [`plugin/gltf_to_minecraft.js`](plugin/gltf_to_minecraft.js) and use
+*Load Plugin from File*. Blockbench 4.9 or newer, desktop or web.
+
 ## Customizable Player Models
 
 File → Import → *Import glTF as Customizable Player Model* runs the same
@@ -220,6 +235,64 @@ they are best changed one at a time.
 **Install:** Blockbench → File → Plugins, search for *glTF to Minecraft*. A
 version from this repository installs through *Load Plugin from File* →
 [`plugin/gltf_to_minecraft.js`](plugin/gltf_to_minecraft.js).
+
+## Questions people ask
+
+### How do I import a Sketchfab model into Blockbench?
+
+Install the plugin, then *File → Import → Import from Sketchfab*. Search, click a
+card, and the model is downloaded and converted into cubes. Searching is free;
+downloading needs a free Sketchfab API token, from *Settings → Password & API* on
+Sketchfab. Only models their author allows to be downloaded are listed.
+
+### How do I convert a glTF or GLB model into a Minecraft model?
+
+*File → Import → Import glTF Model*, then pick a `.zip`, or the `.gltf`/`.glb`
+file together with its `.bin` and textures. Choose what to build into —
+GeckoLib, Bedrock Entity, Generic Model or a Java block/item model — and the model
+arrives as cubes, with bones, textures and animations where the format has them.
+
+### How do I turn a 3D model into a GeckoLib entity or a Bedrock mob?
+
+Import it as above and choose *GeckoLib* (Java mods) or *Bedrock Entity*
+(add-ons). The bones keep their hierarchy and animations are carried over, so the
+project can be exported from Blockbench as it is. GeckoLib needs its Blockbench
+plugin, which the dialog points to.
+
+### How do I make a block or item model for a resource pack from a glTF?
+
+Choose *Java Block/Item* in the import dialog. The model is fitted into the box
+Minecraft allows, and the report says which Minecraft version its cube rotations
+need.
+
+### Can I use a 3D model as a Customizable Player Models skin?
+
+Yes: *File → Import → Import glTF as Customizable Player Model* runs the same
+import, asks for the height and which bone is which part of the player, and saves
+a `.cpmproject`. See [Customizable Player Models](#customizable-player-models).
+
+### Blockbench opens my glTF as meshes. How do I get cubes?
+
+Blockbench's own glTF import keeps every element a mesh, which Minecraft formats
+cannot take. This plugin rebuilds the model out of cubes instead: boxes stay
+boxes, and rounded or bevelled parts become thin turned plates.
+
+### Are animations kept?
+
+Yes, for GeckoLib, Bedrock Entity and Generic Model: rotation and position
+channels are carried over. Java block and item models do not animate, so the
+model arrives still.
+
+### Why do some faces come out black, or the whole model wear one texture?
+
+Usually the file lost something on its way — a texture's transparency, or which
+part uses which material. The report says so when it can tell;
+[troubleshooting](docs/troubleshooting.md) lists the causes and what to do.
+
+### Is it free?
+
+Yes, under the MIT licence. Imported models keep their own licences; for a model
+from Sketchfab the report prints its author and licence, so the credit is not lost.
 
 ## Testing without Blockbench
 

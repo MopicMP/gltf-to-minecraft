@@ -3,6 +3,23 @@
 The import report is the first place to look: every case below leaves a line in
 it. The report can be saved to a file from its window.
 
+## The import says a limit was exceeded or the hierarchy contains a cycle
+
+The importer rejects cyclic node graphs and caps work before allocating model
+data. Limits are 20,000 nodes, 256 levels of hierarchy, 40,000 node visits,
+1,000,000 entries in one accessor and 4,000,000 decoded accessor components per
+parse, including animation data.
+
+ZIPs are limited to 64 MiB compressed, 4,096 entries, 64 MiB per expanded file and
+128 MiB of expanded data in total. Download and decompression use streams; a build
+without streaming support reports an error instead of buffering an unlimited
+archive. Loose files remain available through the same picker.
+
+Textures must be no larger than 8,192 pixels on either side, with at most
+16,777,216 pixels per image and 33,554,432 pixels across the model's colour images.
+PNG scanlines must match the declared dimensions. Reduce the model or texture
+size, remove unnecessary files from the archive, or re-export a malformed model.
+
 ## The figure is black or dark where it should be skin
 
 **Cause:** the texture lost its alpha channel. A Minecraft-style figure has an

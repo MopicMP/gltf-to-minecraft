@@ -305,6 +305,7 @@ node tools/verify-gltf.mjs        model/model.obj    # glTF parsing against a ba
 node tools/verify-snap.mjs                           # grid snapping and its cost
 node tools/verify-coplanar.mjs                       # coplanar face separation
 node tools/verify-images.mjs                         # PNG/JPEG/GIF/WebP headers
+node tools/verify-import-limits.mjs                  # hostile input limits and valid controls
 node tools/verify-cpm.mjs                            # .cpmproject: structure, limits, geometry
 node tools/verify-java-fit.mjs                       # Java models: the box and the Minecraft version
 node tools/verify-outliner.mjs                       # the outliner: folders dropped, none animated lost

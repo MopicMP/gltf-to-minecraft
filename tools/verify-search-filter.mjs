@@ -215,11 +215,21 @@ console.log('\n=== A download, with Sketchfab stood in for ===');
 			}
 			const name = url.replace(/^.*\/|\.zip$/g, '');
 			const files = archives[name];
-			return files === 'broken' ? { ok: false, status: 500 } : { ok: true, arrayBuffer: async () => ({ name }) };
+			return files === 'broken' ? { ok: false, status: 500 } : {
+				ok: true, body: new ReadableStream({ start(controller) {
+					controller.enqueue(new TextEncoder().encode(name)); controller.close();
+				} }),
+			};
 		};
 		globalThis.JSZip = {
 			loadAsync: async buf => ({
-				forEach: cb => Object.keys(archives[buf.name]).forEach(n => cb(n, { dir: false, async: async () => new Uint8Array([1]) })),
+				forEach: cb => Object.keys(archives[new TextDecoder().decode(buf)]).forEach(n => cb(n, {
+					dir: false, internalStream() {
+						const handlers = {};
+						return { on(event, fn) { handlers[event] = fn; return this; }, pause() {},
+							resume() { handlers.data(new Uint8Array([1])); handlers.end(); return this; } };
+					},
+				})),
 			}),
 		};
 		const got = await sketchfabDownload('uid', 'token', () => { });

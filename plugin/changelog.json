@@ -96,7 +96,14 @@
 					"The format list in the import dialog was cut off; the explanation now sits under it.",
 					"Panels a thousandth of a pixel thick — leaves, awnings, signs — came out with both sides empty, and vanished.",
 					"Textures of materials in the specular-glossiness workflow were not read, so parts wore another part's picture.",
-					"Toon outlines made as inside-out copies of a part covered that part with a dark casing; such outlines are now left out."
+					"Toon outlines made as inside-out copies of a part covered that part with a dark casing; such outlines are now left out.",
+					"Thanks to Snownee for reporting the invisible-cube bug (#1)."
+				]
+			},
+			{
+				"title": "Security",
+				"list": [
+					"Hostile input limits: cyclic node graphs, oversized accessors, ZIP bombs and oversized images are rejected before allocation. Thanks to HadesScience (#2)."
 				]
 			}
 		]

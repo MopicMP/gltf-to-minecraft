@@ -1,0 +1,29 @@
+name: Daily install count
+
+on:
+  schedule:
+    - cron: '0 6 * * *'   # every day at 06:00 UTC
+  workflow_dispatch:       # and on a manual press of the button
+
+permissions:
+  contents: write
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch and append
+        run: |
+          count=$(curl -sf 'https://blckbn.ch/api/stats/plugins?weeks=1' | python3 -c "import sys,json; print(json.load(sys.stdin).get('gltf_to_minecraft',0))")
+          date=$(date -u +%Y-%m-%d)
+          echo "$date,$count" >> stats/installs.csv
+          echo "Recorded: $date $count"
+      - name: Commit
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add stats/installs.csv
+          git diff --cached --quiet && echo 'nothing new' && exit 0
+          git commit -m "stats: $( tail -1 stats/installs.csv )"
+          git push

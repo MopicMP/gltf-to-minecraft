@@ -563,7 +563,7 @@ const sandbox = {
 				})));
 				return;
 			}
-			cb([{ name: 'model(gltf).zip', content: null }]);
+			cb([{ name: 'model(gltf).zip', content: new Uint8Array(1) }]);
 		},
 		export(opts) { exported = opts; },
 	},
@@ -581,7 +581,11 @@ const sandbox = {
 			return Promise.resolve({
 				forEach(cb) {
 					for (const [name, bytes] of Object.entries(zipContents())) {
-						cb(name, { dir: false, async: () => Promise.resolve(bytes) });
+						cb(name, { dir: false, internalStream() {
+							const handlers = {};
+							return { on(event, fn) { handlers[event] = fn; return this; }, pause() {},
+								resume() { handlers.data(bytes); handlers.end(); return this; } };
+						} });
 					}
 				},
 			});

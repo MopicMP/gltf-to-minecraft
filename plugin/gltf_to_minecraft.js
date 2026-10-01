@@ -829,24 +829,102 @@ function parseGLB(bytes) {
 	return { json, bin };
 }
 
+// Budgets apply before allocation, including implicit-zero and compressed inputs.
+const IMPORT_LIMITS = Object.freeze({
+	nodes: 20000, depth: 256, nodeVisits: 40000,
+	accessorCount: 1000000, accessorComponents: 4000000,
+	archiveEntries: 4096, archiveInputBytes: 64 * 1024 * 1024,
+	archiveEntryBytes: 64 * 1024 * 1024, archiveBytes: 128 * 1024 * 1024,
+	imageSide: 8192, imagePixels: 16 * 1024 * 1024, totalImagePixels: 32 * 1024 * 1024,
+});
+
+class ImportLimitError extends Error {}
+
+function boundedInteger(value, max, label) {
+	if (!Number.isSafeInteger(value) || value < 0 || value > max) {
+		throw new ImportLimitError(`${label} must be an integer between 0 and ${max}`);
+	}
+	return value;
+}
+
+function checkImageDimensions(width, height) {
+	boundedInteger(width, IMPORT_LIMITS.imageSide, 'image width');
+	boundedInteger(height, IMPORT_LIMITS.imageSide, 'image height');
+	if (!width || !height || width * height > IMPORT_LIMITS.imagePixels) {
+		throw new ImportLimitError(`image exceeds the ${IMPORT_LIMITS.imagePixels} pixel limit`);
+	}
+}
+
+function checkedImageSize(width, height) {
+	checkImageDimensions(width, height);
+	return { width, height };
+}
+
+/** Validate the graph without recursion, before either wrapper or scene traversal. */
+function validateNodeGraph(nodes, roots) {
+	boundedInteger(nodes.length, IMPORT_LIMITS.nodes, 'node count');
+	boundedInteger(roots.length, IMPORT_LIMITS.nodes, 'scene root count');
+	let edges = 0;
+	const state = new Uint8Array(nodes.length);
+	const checkIndex = i => {
+		boundedInteger(i, nodes.length - 1, 'node index');
+		if (!nodes[i] || !Array.isArray(nodes[i].children || [])) throw new Error('invalid node children');
+	};
+	for (const r of roots) checkIndex(r);
+	for (let i = 0; i < nodes.length; i++) {
+		if (state[i] === 2) continue;
+		const stack = [{ index: i, exit: false }];
+		while (stack.length) {
+			const frame = stack.pop(), idx = frame.index;
+			checkIndex(idx);
+			if (frame.exit) { state[idx] = 2; continue; }
+			if (state[idx] === 1) throw new Error('glTF node hierarchy contains a cycle');
+			if (state[idx] === 2) continue;
+			state[idx] = 1;
+			stack.push({ index: idx, exit: true });
+			const children = nodes[idx].children || [];
+			edges += children.length;
+			boundedInteger(edges, IMPORT_LIMITS.nodeVisits, 'node child references');
+			for (let j = children.length - 1; j >= 0; j--) stack.push({ index: children[j], exit: false });
+		}
+	}
+}
+
+/** A view-relative span, checked before any accessor tuples are allocated. */
+function accessorView(gltf, buffers, index, offset, count, size, stride) {
+	const view = (gltf.bufferViews || [])[index];
+	if (!view) throw new Error(`missing bufferView ${index}`);
+	const buf = buffers[view.buffer];
+	if (!buf) throw new Error(`missing buffer ${view.buffer}`);
+	const start = boundedInteger(view.byteOffset || 0, buf.byteLength, 'bufferView offset');
+	const length = boundedInteger(view.byteLength, buf.byteLength - start, 'bufferView length');
+	boundedInteger(offset, length, 'accessor offset');
+	boundedInteger(stride, IMPORT_LIMITS.archiveBytes, 'accessor stride');
+	const bytes = count ? (count - 1) * stride + size : 0;
+	if (stride < size || bytes > length - offset) throw new Error('accessor exceeds its bufferView');
+	return { dv: new DataView(buf.buffer, buf.byteOffset, buf.byteLength), base: start + offset };
+}
+
 /** Reads a whole accessor: an array of tuples sized by component count. */
-function readAccessor(gltf, buffers, index) {
+function readAccessor(gltf, buffers, index, budget = { components: 0 }) {
 	const acc = gltf.accessors[index];
+	if (!acc) throw new Error(`missing accessor ${index}`);
 	const comp = GLTF_COMPONENTS[acc.componentType];
 	if (!comp) throw new Error(`unknown componentType ${acc.componentType}`);
 	const n = GLTF_TYPE_SIZE[acc.type];
 	if (!n) throw new Error(`unknown accessor type ${acc.type}`);
+	boundedInteger(acc.count, IMPORT_LIMITS.accessorCount, 'accessor count');
+	budget.components += acc.count * n;
+	boundedInteger(budget.components, IMPORT_LIMITS.accessorComponents, 'decoded accessor components');
+	if (acc.sparse) boundedInteger(acc.sparse.count, acc.count, 'sparse accessor count');
 
 	const out = [];
 	if (acc.bufferView === undefined) {
 		for (let i = 0; i < acc.count; i++) out.push(new Array(n).fill(0));
 	} else {
 		const view = gltf.bufferViews[acc.bufferView];
-		const buf = buffers[view.buffer];
-		if (!buf) throw new Error(`missing buffer ${view.buffer}`);
-		const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-		const base = (view.byteOffset || 0) + (acc.byteOffset || 0);
 		const stride = view.byteStride || comp.size * n;
+		const { dv, base } = accessorView(gltf, buffers, acc.bufferView, acc.byteOffset || 0, acc.count, comp.size * n, stride);
 		for (let i = 0; i < acc.count; i++) {
 			const el = [];
 			for (let c = 0; c < n; c++) el.push(comp.read(dv, base + i * stride + c * comp.size));
@@ -857,17 +935,16 @@ function readAccessor(gltf, buffers, index) {
 	// sparse accessors: some values are overridden
 	if (acc.sparse) {
 		const idxAcc = acc.sparse.indices, valAcc = acc.sparse.values;
-		const idxView = gltf.bufferViews[idxAcc.bufferView];
-		const valView = gltf.bufferViews[valAcc.bufferView];
 		const idxComp = GLTF_COMPONENTS[idxAcc.componentType];
-		const ib = buffers[idxView.buffer], vb = buffers[valView.buffer];
-		const idv = new DataView(ib.buffer, ib.byteOffset, ib.byteLength);
-		const vdv = new DataView(vb.buffer, vb.byteOffset, vb.byteLength);
+		if (![5121, 5123, 5125].includes(idxAcc.componentType)) throw new Error('invalid sparse index componentType');
+		const { dv: idv, base: ibase } = accessorView(gltf, buffers, idxAcc.bufferView, idxAcc.byteOffset || 0, acc.sparse.count, idxComp.size, idxComp.size);
+		const { dv: vdv, base: vbase } = accessorView(gltf, buffers, valAcc.bufferView, valAcc.byteOffset || 0, acc.sparse.count, comp.size * n, comp.size * n);
 		for (let i = 0; i < acc.sparse.count; i++) {
-			const target = idxComp.read(idv, (idxView.byteOffset || 0) + (idxAcc.byteOffset || 0) + i * idxComp.size);
+			const target = idxComp.read(idv, ibase + i * idxComp.size);
+			boundedInteger(target, acc.count - 1, 'sparse accessor index');
 			const el = [];
 			for (let c = 0; c < n; c++) {
-				el.push(comp.read(vdv, (valView.byteOffset || 0) + (valAcc.byteOffset || 0) + (i * n + c) * comp.size));
+				el.push(comp.read(vdv, vbase + (i * n + c) * comp.size));
 			}
 			out[target] = el;
 		}
@@ -959,7 +1036,7 @@ function boneDeltaPosition(rest, parentQuat, value, mode, deltaRot) {
  * The conversion happens later, once each bone's rest pose is known — here we
  * only extract the data faithfully.
  */
-function parseAnimations(gltf, buffers, warnings) {
+function parseAnimations(gltf, buffers, warnings, budget = { components: 0 }) {
 	const out = [];
 	for (const anim of gltf.animations || []) {
 		const channels = [];
@@ -972,8 +1049,8 @@ function parseAnimations(gltf, buffers, warnings) {
 				continue;
 			}
 			try {
-				const times = readAccessor(gltf, buffers, sampler.input).map(t => t[0]);
-				const values = readAccessor(gltf, buffers, sampler.output);
+				const times = readAccessor(gltf, buffers, sampler.input, budget).map(t => t[0]);
+				const values = readAccessor(gltf, buffers, sampler.output, budget);
 				if (times.length) length = Math.max(length, times[times.length - 1]);
 				channels.push({
 					node: ch.target.node,
@@ -982,6 +1059,7 @@ function parseAnimations(gltf, buffers, warnings) {
 					times, values,
 				});
 			} catch (e) {
+				if (e instanceof ImportLimitError) throw e;
 				warnings.push(`animation “${anim.name}”: channel skipped (${(e && e.message) || e})`);
 			}
 		}
@@ -1320,6 +1398,9 @@ function parseGLTFFiles(files, opts) {
 	const hierarchy = [];
 	const scene = gltf.scenes && gltf.scenes[gltf.scene || 0];
 	const roots = scene ? scene.nodes : (gltf.nodes || []).map((_, i) => i);
+	validateNodeGraph(gltf.nodes || [], roots);
+	const accessorBudget = { components: 0 };
+	let nodeVisits = 0;
 	// The export wrapper: Sketchfab_model -> root -> GLTF_SceneRootNode.
 	// The first node carries showcase placement (an arbitrary rotation and
 	// offset), which we drop. An axis-aligned rotation in the chain is the
@@ -1356,7 +1437,9 @@ function parseGLTFFiles(files, opts) {
 		}
 	}
 
-	const visit = (nodeIndex, parent, parentIndex, parentQuat) => {
+	const visit = (nodeIndex, parent, parentIndex, parentQuat, depth = 0) => {
+		boundedInteger(depth, IMPORT_LIMITS.depth, 'node hierarchy depth');
+		boundedInteger(++nodeVisits, IMPORT_LIMITS.nodeVisits, 'node visits');
 		const node = gltf.nodes[nodeIndex];
 		if (!node) return;
 		const wrap = skipSet.get(nodeIndex);
@@ -1425,7 +1508,7 @@ function parseGLTFFiles(files, opts) {
 				// A placeholder face keeps its geometry — the cube needs its corners —
 				// but gets no UV, so it stays hidden as it was in Blockbench.
 				const blank = imageIndex >= 0 && !!images[imageIndex] && images[imageIndex].blank;
-				const pos = readAccessor(gltf, buffers, posIdx).map(p => {
+				const pos = readAccessor(gltf, buffers, posIdx, accessorBudget).map(p => {
 					const w = matApply(world, p);
 					return [w[0] * scale + offset[0], w[1] * scale + offset[1], w[2] * scale + offset[2]];
 				});
@@ -1447,13 +1530,13 @@ function parseGLTFFiles(files, opts) {
 					? (imageIndex >= 0 ? o.uvRects[imageIndex] : (o.uvFallback || null))
 					: null;
 				const uv = uvIdx === undefined || blank ? null
-					: readAccessor(gltf, buffers, uvIdx).map(t => rect
+					: readAccessor(gltf, buffers, uvIdx, accessorBudget).map(t => rect
 						? [t[0] * rect.w + rect.x, t[1] * rect.h + rect.y]
 						: [t[0] * uvW, t[1] * uvH]);
 
 				const idx = prim.indices === undefined
 					? pos.map((_, i) => i)
-					: readAccessor(gltf, buffers, prim.indices).map(a => a[0]);
+					: readAccessor(gltf, buffers, prim.indices, accessorBudget).map(a => a[0]);
 
 				for (const tri of TRIANGULATE[prim.mode === undefined ? 4 : prim.mode](idx)) {
 					const face = {
@@ -1501,7 +1584,7 @@ function parseGLTFFiles(files, opts) {
 			}
 		}
 
-		for (const child of node.children || []) visit(child, world, nodeIndex, worldQuat);
+		for (const child of node.children || []) visit(child, world, nodeIndex, worldQuat, depth + 1);
 	};
 
 	// The extra rotation is applied as the base coordinate system: it reaches
@@ -1524,7 +1607,7 @@ function parseGLTFFiles(files, opts) {
 		blank: { triangles: blankTriangles, objects: blankObjects },
 		// inside-out outline shells left out
 		outlineShells,
-		animations: parseAnimations(gltf, buffers, warnings),
+		animations: parseAnimations(gltf, buffers, warnings, accessorBudget),
 	};
 }
 
@@ -2010,16 +2093,60 @@ async function sketchfabDownload(uid, token, onProgress) {
 async function sketchfabUnpack(url, say) {
 	const r = await fetch(url);
 	if (!r.ok) throw new Error('archive returned HTTP ' + r.status);
-	const buf = await r.arrayBuffer();
+	if (!r.body || !r.body.getReader) throw new Error('This build cannot stream archive downloads safely');
+	const reader = r.body.getReader(), chunks = [];
+	let size = 0;
+	try {
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			size += value.byteLength;
+			boundedInteger(size, IMPORT_LIMITS.archiveInputBytes, 'archive download bytes');
+			chunks.push(value);
+		}
+	} catch (e) { await reader.cancel().catch(() => {}); throw e; }
+	finally { reader.releaseLock(); }
+	const buf = new Uint8Array(size);
+	let at = 0;
+	for (const chunk of chunks) { buf.set(chunk, at); at += chunk.length; }
 	say('unpacking…');
-	const zip = await JSZip.loadAsync(buf);
-	const entries = {};
-	const tasks = [];
-	zip.forEach((relPath, entry) => {
-		if (entry.dir) return;
-		tasks.push(entry.async('uint8array').then(data => { entries[relPath] = data; }));
+	return unpackModelArchive(buf);
+}
+
+/** Both archive entry points count actual streamed output, never just ZIP metadata. */
+async function unpackModelArchive(bytes) {
+	boundedInteger(bytes.byteLength, IMPORT_LIMITS.archiveInputBytes, 'archive input bytes');
+	const zip = await JSZip.loadAsync(bytes);
+	const members = [], entries = Object.create(null);
+	let count = 0, total = 0;
+	zip.forEach((name, entry) => {
+		boundedInteger(++count, IMPORT_LIMITS.archiveEntries, 'archive entry count');
+		if (!entry.dir) members.push({ name, entry });
 	});
-	await Promise.all(tasks);
+	for (const { name, entry } of members) {
+		if (typeof entry.internalStream !== 'function') throw new Error('This JSZip build cannot stream archive entries safely');
+		entries[name] = await new Promise((resolve, reject) => {
+			const chunks = [], stream = entry.internalStream('uint8array');
+			let size = 0, failed = false;
+			stream.on('data', chunk => {
+				if (failed) return;
+				try {
+					size += chunk.byteLength; total += chunk.byteLength;
+					boundedInteger(size, IMPORT_LIMITS.archiveEntryBytes, 'archive entry bytes');
+					boundedInteger(total, IMPORT_LIMITS.archiveBytes, 'archive expanded bytes');
+					chunks.push(chunk);
+				} catch (e) { failed = true; stream.pause(); reject(e); }
+			}).on('error', e => { failed = true; reject(e); }).on('end', () => {
+				if (failed) return;
+				try {
+					const out = new Uint8Array(size);
+					let offset = 0;
+					for (const chunk of chunks) { out.set(chunk, offset); offset += chunk.length; }
+					resolve(out);
+				} catch (e) { reject(e); }
+			}).resume();
+		});
+	}
 	return entries;
 }
 
@@ -3715,14 +3842,21 @@ function decodePNG(bytes) {
 	while (pos + 8 <= bytes.length) {
 		const n = dv.getUint32(pos);
 		const t = String.fromCharCode(bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]);
+		if (pos + 12 + n > bytes.length) throw new ImportLimitError('truncated PNG chunk');
 		const d = bytes.subarray(pos + 8, pos + 8 + n);
-		if (t === 'IHDR') { w = dv.getUint32(pos + 8); h = dv.getUint32(pos + 12); depth = d[8]; type = d[9]; interlace = d[12]; }
+		if (t === 'IHDR') {
+			if (pos !== 8 || n !== 13) throw new ImportLimitError('invalid or duplicate PNG header');
+			w = dv.getUint32(pos + 8); h = dv.getUint32(pos + 12);
+			checkImageDimensions(w, h);
+			depth = d[8]; type = d[9]; interlace = d[12];
+		}
 		else if (t === 'PLTE') palette = d;
 		else if (t === 'tRNS') trns = d;
 		else if (t === 'IDAT') idat.push(d);
 		else if (t === 'IEND') break;
 		pos += 12 + n;
 	}
+	checkImageDimensions(w, h);
 	const ch = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 }[type];
 	if (!ch || interlace || ![1, 2, 4, 8].includes(depth) || (depth < 8 && ch !== 1)) {
 		throw new Error(`PNG kind not read here (type ${type}, depth ${depth}${interlace ? ', interlaced' : ''})`);
@@ -3735,6 +3869,7 @@ function decodePNG(bytes) {
 	const stride = Math.ceil(w * ch * depth / 8), bpp = Math.max(1, ch * depth / 8);
 	// a zlib stream: two bytes of header before the deflate data
 	const raw = inflateRaw(z.subarray(2), (stride + 1) * h);
+	if (raw.length !== (stride + 1) * h) throw new ImportLimitError('incomplete PNG scanlines');
 	const out = new Uint8ClampedArray(w * h * 4);
 	const packed = (line, x) => (line[(x * depth) >> 3] >> (8 - depth - ((x * depth) & 7))) & ((1 << depth) - 1);
 	let prev = new Uint8Array(stride);
@@ -4238,7 +4373,7 @@ if (typeof Plugin === 'undefined') {
 			qMul, qConj, qRotate, boneDeltaRotation, boneDeltaPosition, sampleChannel, pickScale, snapScale, texelScale, correctionQuat, packAtlas, splitComponents, insideOutShells, enclosedVolume, boxFromBounds, TRIANGULATE, isDegenerate, imageSize, sniffMime, axisRotationOf, quatFromMat, triangleNormal, snapGrid, snapVec, snapAngle, isIdentityBasis, placeCoords, snapSafely, tidyVec, hasGltfArchive, sketchfabSearchURL, SKETCHFAB_SORTS, sketchfabEmbedURL, sketchfabPageURL, sketchfabArchives, sketchfabCredit, sketchfabDownload, hasAlphaChannel, resolveCoplanar, cubeFaces, faceRectsOverlap,
 			JAVA_BOX, fitJavaBox, applyFit, javaFormatFor, versionBelow, tidyHierarchy, GENERIC_NODE, cubeHint,
 			uniqueName, nameSlug, placeBeside, texturePlan, placeRect,
-			isBlankImage, inflateRaw,
+			isBlankImage, inflateRaw, IMPORT_LIMITS, unpackModelArchive, decodePicture,
 			ROUND, ROUND_MODES, uniquePoints, hull2d, boxAlong, minVolumeBox, closestOnTriangle, rayTriangle, boxFitsPart, flatRegions, creaseTest, flatLocator, plateFor, plateMask, stripsFor, plateMaskBesideStrips, shapePart, piecesAt, piecesForPart, decodePNG, samplePicture, faceUVAt, regionPainter, boxPainter, bakePiece, BOX_SIDES, pieceQuads, cullDirections, coverage, rebuildNotBoxes, pieceFaces, mapFaceUVs, boxOfSolution, sourceQuads, colourTextureOf,
 			buildCPMFiles, buildCPMConfig, buildCPMAnimations, cpmAlignOffset, cpmEstimateSize, cpmAutoAssign, cpmAutoPose, cpmPoint, cpmDelta, cpmEuler, cpmEulerFromQuat, cpmAngle, cpmUVScale, cpmFaceUV, CPM_PARTS, CPM_PART_NAMES, CPM_FACE,
 		};
@@ -4830,26 +4965,25 @@ function imageSize(bytes) {
 	const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 
 	// PNG: signature, then IHDR with width and height straight away.
-	if (dv.getUint32(0) === 0x89504E47) return { width: dv.getUint32(16), height: dv.getUint32(20) };
+	if (dv.getUint32(0) === 0x89504E47) return checkedImageSize(dv.getUint32(16), dv.getUint32(20));
 
 	// GIF: 'GIF8', size lives in the logical screen descriptor, little-endian.
-	if (dv.getUint32(0) === 0x47494638) return { width: dv.getUint16(6, true), height: dv.getUint16(8, true) };
+	if (dv.getUint32(0) === 0x47494638) return checkedImageSize(dv.getUint16(6, true), dv.getUint16(8, true));
 
 	// WebP: 'RIFF'...'WEBP', then three sub-formats with different layouts.
 	if (dv.getUint32(0) === 0x52494646 && dv.getUint32(8) === 0x57454250) {
 		const tag = dv.getUint32(12);
 		if (tag === 0x56503820 && bytes.length > 30) {          // 'VP8 ' — lossy
-			return { width: dv.getUint16(26, true) & 0x3FFF, height: dv.getUint16(28, true) & 0x3FFF };
+			return checkedImageSize(dv.getUint16(26, true) & 0x3FFF, dv.getUint16(28, true) & 0x3FFF);
 		}
 		if (tag === 0x5650384C && bytes.length > 25) {          // 'VP8L' — lossless
 			const b = dv.getUint32(21, true);
-			return { width: (b & 0x3FFF) + 1, height: ((b >> 14) & 0x3FFF) + 1 };
+			return checkedImageSize((b & 0x3FFF) + 1, ((b >> 14) & 0x3FFF) + 1);
 		}
 		if (tag === 0x56503858 && bytes.length > 30) {          // 'VP8X' extended
-			return {
-				width: (bytes[24] | (bytes[25] << 8) | (bytes[26] << 16)) + 1,
-				height: (bytes[27] | (bytes[28] << 8) | (bytes[29] << 16)) + 1,
-			};
+			return checkedImageSize(
+				(bytes[24] | (bytes[25] << 8) | (bytes[26] << 16)) + 1,
+				(bytes[27] | (bytes[28] << 8) | (bytes[29] << 16)) + 1);
 		}
 		return null;
 	}
@@ -4866,7 +5000,7 @@ function imageSize(bytes) {
 			const len = dv.getUint16(p + 2);
 			// SOFn (except DHT/JPG/DAC — 0xC4, 0xC8, 0xCC) carry the frame size.
 			if (marker >= 0xC0 && marker <= 0xCF && marker !== 0xC4 && marker !== 0xC8 && marker !== 0xCC) {
-				return { width: dv.getUint16(p + 7), height: dv.getUint16(p + 5) };
+				return checkedImageSize(dv.getUint16(p + 7), dv.getUint16(p + 5));
 			}
 			if (len < 2) return null;
 			p += 2 + len;
@@ -5547,21 +5681,34 @@ function writeSheet(data, width, rect, sh) {
  * A picture's pixels, for baking the sheets of rebuilt parts: a PNG is read here,
  * anything else — a JPEG from Sketchfab — through a canvas. Null when neither can.
  */
-function decodePicture(img) {
-	try { return Promise.resolve(decodePNG(img.bytes)); } catch (e) { /* not a PNG read here: the canvas */ }
-	return new Promise(resolve => {
+function decodePicture(img, budget = { pixels: 0 }) {
+	// Check headers before the native decoder, and never fall back after a limit error.
+	let reserved = 0;
+	try {
+		const size = imageSize(img.bytes);
+		if (size) {
+			reserved = size.width * size.height;
+			budget.pixels += reserved;
+			boundedInteger(budget.pixels, IMPORT_LIMITS.totalImagePixels, 'decoded image pixels');
+		}
+		return Promise.resolve(decodePNG(img.bytes));
+	} catch (e) { if (e instanceof ImportLimitError) return Promise.reject(e); }
+	return new Promise((resolve, reject) => {
 		try {
 			const el = new Image();
 			el.onload = () => {
 				try {
 					const w = el.naturalWidth || el.width, h = el.naturalHeight || el.height;
+					checkImageDimensions(w, h);
+					budget.pixels += w * h - reserved;
+					boundedInteger(budget.pixels, IMPORT_LIMITS.totalImagePixels, 'decoded image pixels');
 					const canvas = document.createElement('canvas');
 					canvas.width = w;
 					canvas.height = h;
 					const ctx = canvas.getContext('2d');
 					ctx.drawImage(el, 0, 0);
 					resolve({ w, h, data: ctx.getImageData(0, 0, w, h).data });
-				} catch (e) { resolve(null); }
+				} catch (e) { if (e instanceof ImportLimitError) reject(e); else resolve(null); }
 			};
 			el.onerror = () => resolve(null);
 			el.src = 'data:' + (img.mime || 'image/png') + ';base64,' + bytesToBase64(img.bytes);
@@ -5787,6 +5934,7 @@ async function buildFromFiles(files, sourceName, opts) {
 	const usable = (img, i) => !!img.size && img.role !== 'aux' && !img.blank
 		&& (!reached.size || reached.has(i));
 	const images = sized.filter(usable);
+	boundedInteger(images.reduce((n, img) => n + img.size.width * img.size.height, 0), IMPORT_LIMITS.totalImagePixels, 'model image pixels');
 	const remap = [];
 	let next = 0;
 	sized.forEach((img, i) => { remap[i] = usable(img, i) ? next++ : -1; });
@@ -6054,7 +6202,8 @@ async function buildFromFiles(files, sourceName, opts) {
 	const bad = badMode === 'rebuild' ? parsed.objects.filter(o => o.bad) : [];
 	if (bad.length) {
 		const began = Date.now();
-		const pictures = await Promise.all(images.map(decodePicture));
+		const pictureBudget = { pixels: 0 };
+		const pictures = await Promise.all(images.map(img => decodePicture(img, pictureBudget)));
 		const pictureOf = face => {
 			const i = face.image >= 0 && remap[face.image] >= 0 ? remap[face.image] : mainIndex;
 			return pictures[i] || pictures[mainIndex] || null;
@@ -7766,17 +7915,9 @@ function pickAndImport(opts, then) {
 				});
 				return;
 			}
-			JSZip.loadAsync(archive.content).then(zip => {
-				const entries = {};
-				const tasks = [];
-				zip.forEach((relPath, entry) => {
-					if (entry.dir) return;
-					tasks.push(entry.async('uint8array').then(data => { entries[relPath] = data; }));
-				});
-				return Promise.all(tasks)
-					.then(() => buildFromFiles(entries, archive.name, opts))
-					.then(built => { if (then) then(built); });
-			}).catch(fail);
+			unpackModelArchive(archive.content)
+				.then(entries => buildFromFiles(entries, archive.name, opts))
+				.then(built => { if (then) then(built); }).catch(fail);
 			return;
 		}
 

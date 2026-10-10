@@ -110,5 +110,5 @@ if (problems.length) {
 }
 
 const pass = matched === baseline.length && uvBad === 0 && failed === 0;
-console.log(`\n${pass ? '✅ THE ORIGINAL glTF PARSES EXACTLY LIKE THE OBJ' : '❌ THERE ARE DIFFERENCES'}\n`);
+console.log(`\n${pass ? 'PASS: THE ORIGINAL glTF PARSES EXACTLY LIKE THE OBJ' : 'FAIL: THERE ARE DIFFERENCES'}\n`);
 process.exit(pass ? 0 : 1);

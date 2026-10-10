@@ -11,6 +11,8 @@
  * is synthetic here. What is checked is that the code RUNS, not that it is right.
  *
  * Run: node tools/smoke-plugin.mjs
+ * SMOKE_DEBUG=1 prints every dialog and message box as it appears, which is how to
+ * tell which window a run is actually waiting on.
  */
 import fs from 'node:fs';
 import vm from 'node:vm';
@@ -28,6 +30,7 @@ const clamp = v => Math.min(1, Math.max(-1, v));
 class Quaternion {
 	constructor(x = 0, y = 0, z = 0, w = 1) { Object.assign(this, { x, y, z, w }); }
 	clone() { return new Quaternion(this.x, this.y, this.z, this.w); }
+	set(x, y, z, w) { Object.assign(this, { x, y, z, w }); return this; }
 	invert() { this.x *= -1; this.y *= -1; this.z *= -1; return this; }
 	multiply(q) {
 		const { x: ax, y: ay, z: az, w: aw } = this;
@@ -72,6 +75,16 @@ class Euler {
 class Vector3 {
 	constructor(x = 0, y = 0, z = 0) { Object.assign(this, { x, y, z }); }
 	length() { return Math.hypot(this.x, this.y, this.z); }
+	set(x, y, z) { Object.assign(this, { x, y, z }); return this; }
+	clone() { return new Vector3(this.x, this.y, this.z); }
+	subVectors(a, b) { return this.set(a.x - b.x, a.y - b.y, a.z - b.z); }
+	crossVectors(a, b) {
+		return this.set(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
+	}
+	normalize() {
+		const len = this.length();
+		return len ? this.set(this.x / len, this.y / len, this.z / len) : this;
+	}
 	applyQuaternion(q) {
 		const { x, y, z } = this;
 		const ix = q.w * x + q.y * z - q.z * y;
@@ -90,14 +103,133 @@ class Matrix4 {
 	makeBasis(vx, vy, vz) { this.elements3 = [vx.x, vx.y, vx.z, vy.x, vy.y, vy.z, vz.x, vz.y, vz.z]; return this; }
 }
 
+// ------------------------------------------------- the scene graph of the picture
+//
+// Nothing is drawn here and nothing could be: there is no renderer, and one that
+// only answered calls would say nothing about how the model looks. What a graph
+// does say is whether building the picture and taking it apart again are
+// well-formed — and that was worth having. Without it the window's preview was
+// never built at all in this test, and a disposal that threw went out to a real
+// Blockbench, where it left the window unable to close or import.
+//
+// Only turn and shift are composed down the tree, no scale: those are the only
+// transforms the figure uses, and saying so plainly is better than a matrix
+// nobody checks.
+
+/** Geometries, materials and textures made and still held, so a leak is visible. */
+const glMade = { geometry: 0, material: 0, texture: 0 };
+const glLive = { geometry: 0, material: 0, texture: 0 };
+
+/** Counted on both sides, and only once: disposing twice must not read as a leak healed. */
+function glKeep(thing, kind) {
+	glMade[kind]++;
+	glLive[kind]++;
+	thing.dispose = () => {
+		if (thing.gone) return;
+		thing.gone = true;
+		glLive[kind]--;
+	};
+}
+
+class Object3D {
+	constructor() {
+		this.children = [];
+		this.parent = null;
+		this.position = new Vector3();
+		this.quaternion = new Quaternion();
+		this.rotation = new Euler();
+		this.scale = new Vector3(1, 1, 1);
+		this.worldQuat = new Quaternion();
+		this.worldPos = new Vector3();
+	}
+	add(child) { child.parent = this; this.children.push(child); return this; }
+	remove(child) {
+		const at = this.children.indexOf(child);
+		if (at >= 0) this.children.splice(at, 1);
+		if (child.parent === this) child.parent = null;
+		return this;
+	}
+	traverse(fn) { fn(this); for (const child of this.children.slice()) child.traverse(fn); }
+	updateMatrixWorld() {
+		const q = this.parent ? this.parent.worldQuat : new Quaternion();
+		const p = this.parent ? this.parent.worldPos : new Vector3();
+		this.worldQuat = q.clone().multiply(this.quaternion);
+		const shifted = this.position.clone().applyQuaternion(q);
+		this.worldPos = new Vector3(p.x + shifted.x, p.y + shifted.y, p.z + shifted.z);
+		for (const child of this.children) child.updateMatrixWorld();
+		return this;
+	}
+}
+
+class SceneGroup extends Object3D { }
+
+class Mesh3D extends Object3D {
+	constructor(geometry, material) { super(); this.isMesh = true; this.geometry = geometry; this.material = material; }
+}
+
+class LineSegments extends Object3D {
+	constructor(geometry, material) { super(); this.isLine = true; this.geometry = geometry; this.material = material; }
+}
+
+class BufferAttribute {
+	constructor(array, itemSize) { this.array = array; this.itemSize = itemSize; }
+}
+
+class BufferGeometry {
+	constructor() { this.attributes = {}; glKeep(this, 'geometry'); }
+	setAttribute(name, attribute) { this.attributes[name] = attribute; return this; }
+	computeBoundingBox() { }
+	computeBoundingSphere() { }
+}
+
+class Material {
+	constructor(options) { Object.assign(this, options || {}); glKeep(this, 'material'); }
+}
+
+class SceneTexture {
+	constructor(image) { this.image = image; glKeep(this, 'texture'); }
+}
+
+class Box3 {
+	constructor(min, max) {
+		this.min = min || new Vector3(Infinity, Infinity, Infinity);
+		this.max = max || new Vector3(-Infinity, -Infinity, -Infinity);
+	}
+	isEmpty() { return this.max.x < this.min.x || this.max.y < this.min.y || this.max.z < this.min.z; }
+	getSize(into) { return into.set(this.max.x - this.min.x, this.max.y - this.min.y, this.max.z - this.min.z); }
+	setFromObject(object) {
+		object.updateMatrixWorld();
+		const at = new Vector3();
+		object.traverse(node => {
+			const points = node.geometry && node.geometry.attributes && node.geometry.attributes.position;
+			if (!points) return;
+			for (let i = 0; i + 2 < points.array.length; i += 3) {
+				at.set(points.array[i], points.array[i + 1], points.array[i + 2]).applyQuaternion(node.worldQuat);
+				at.set(at.x + node.worldPos.x, at.y + node.worldPos.y, at.z + node.worldPos.z);
+				this.min.set(Math.min(this.min.x, at.x), Math.min(this.min.y, at.y), Math.min(this.min.z, at.z));
+				this.max.set(Math.max(this.max.x, at.x), Math.max(this.max.y, at.y), Math.max(this.max.z, at.z));
+			}
+		});
+		return this;
+	}
+}
+
 const THREE = {
-	Quaternion, Euler, Vector3, Matrix4,
+	Quaternion, Euler, Vector3, Matrix4, Box3, LineSegments,
+	Group: SceneGroup, Texture: SceneTexture,
+	Object3D, Mesh: Mesh3D,
+	BufferGeometry,
+	Float32BufferAttribute: BufferAttribute,
+	LineBasicMaterial: Material,
+	MeshBasicMaterial: Material,
+	ShaderMaterial: Material,
+	NearestFilter: 1003, LinearFilter: 1006, DoubleSide: 2, FrontSide: 0,
 	MathUtils: { radToDeg: r => r * 180 / Math.PI, degToRad: d => d * Math.PI / 180 },
 };
 
 // ------------------------------------------------- stubbing the Blockbench objects
 
-const created = { cubes: [], groups: [], animations: [], textures: [] };
+const created = { cubes: [], groups: [], animations: [], textures: [], meshes: [] };
 // What an open project already holds when a model is added to it; empty while
 // every import builds a project of its own.
 const openProject = { groups: [], textures: [], animations: [], elements: [] };
@@ -105,7 +237,12 @@ const openProject = { groups: [], textures: [], animations: [], elements: [] };
 const undoLog = [];
 const eventLog = [];
 const canvasLog = [];
+// What the last report said, as words, and the tree it said them in. The window is
+// built out of nodes now, so the words are read off the tree and the tree is kept for
+// the checks that are about parts rather than text: the log block, its fold, the
+// buttons under it.
 let reportShown = null;
+let reportTree = null;
 const problems = [];
 
 class FakeMeshObj {
@@ -170,6 +307,41 @@ class Group {
 Group.first_selected = null;
 Object.defineProperty(Group, 'all', { get: () => [...openProject.groups, ...created.groups] });
 
+/**
+ * A mesh, as the import builds one: vertices put in by position, faces naming
+ * them. Blockbench hands back a key per vertex and a face refers to its corners
+ * by key, never by index, so the stub hands back keys too — that is what the
+ * welding is counted in.
+ */
+class Mesh {
+	constructor(data = {}) {
+		Object.assign(this, data);
+		this.vertices = this.vertices || {};
+		this.faces = {};
+		this.mesh = new FakeMeshObj();
+		this.given = 0;
+	}
+	addVertices(...points) {
+		return points.map(p => {
+			const key = 'v' + (this.given++);
+			this.vertices[key] = [...p];
+			return key;
+		});
+	}
+	addFaces(...faces) {
+		for (const f of faces) this.faces['f' + Object.keys(this.faces).length] = f;
+		return faces;
+	}
+	init() { created.meshes.push(this); return this; }
+	addTo(p) { if (p && p.children) p.children.push(this); this.parent = p; return this; }
+	remove() { const i = created.meshes.indexOf(this); if (i >= 0) created.meshes.splice(i, 1); }
+}
+Object.defineProperty(Mesh, 'all', { get: () => [...created.meshes] });
+
+class MeshFace {
+	constructor(mesh, data = {}) { this.mesh = mesh; Object.assign(this, data); }
+}
+
 class BoneAnimator {
 	constructor(name) { this.name = name; this.rotation = []; this.position = []; this.scale = []; }
 	displayFrame() { }
@@ -205,9 +377,145 @@ class Texture {
 Object.defineProperty(Texture, 'all', { get: () => [...openProject.textures, ...created.textures] });
 Texture.getDefault = () => Texture.all[0];
 
+// ------------------------------------------------------------ a pseudo-DOM
+
+const fakeEvent = type => ({ type, preventDefault() { }, stopPropagation() { }, dataTransfer: null });
+
+/** Everything under a node, deepest last, the node itself left out. */
+function descendants(node, out = []) {
+	for (const child of node.children || []) { out.push(child); descendants(child, out); }
+	return out;
+}
+
+/** One step of a selector: a tag, any number of classes, or both. */
+function selectorHits(node, step) {
+	const parts = String(step).split('.');
+	const tag = parts.shift();
+	if (tag && node.tagName !== tag.toUpperCase()) return false;
+	const has = String(node.className || '').split(/\s+/);
+	return parts.every(c => has.includes(c));
+}
+
+/**
+ * An element, as much of one as the plugin's windows touch.
+ *
+ * The import window builds its whole layout out of nodes instead of handing
+ * Blockbench a form, so the stub has to hold a tree: without appendChild the
+ * window cannot be built at all, and the import under it would go unchecked.
+ *
+ * This says nothing about how the window looks — that is checked in a real
+ * Blockbench, where the layout is. It is here so the way from the file to the
+ * cubes stays testable, and so the window's own wiring runs: the controls the
+ * settings are read back out of are these.
+ */
+function fakeNode(tag) {
+	const node = {
+		tagName: String(tag).toUpperCase(),
+		children: [],
+		parentNode: null,
+		style: {},
+		dataset: {},
+		attrs: {},
+		handlers: {},
+		className: '',
+		title: '',
+		type: '',
+		value: '',
+		checked: false,
+		disabled: false,
+		// the node's own words, with its children's kept in the children
+		own: '',
+	};
+	const classes = () => String(node.className).split(/\s+/).filter(Boolean);
+	node.classList = {
+		add(...c) { node.className = [...new Set([...classes(), ...c])].join(' '); },
+		remove(...c) { node.className = classes().filter(x => !c.includes(x)).join(' '); },
+		contains(c) { return classes().includes(c); },
+		toggle(c, on) {
+			const want = on === undefined ? !classes().includes(c) : !!on;
+			if (want) node.classList.add(c); else node.classList.remove(c);
+		},
+	};
+	Object.defineProperty(node, 'textContent', {
+		get() { return node.own + node.children.map(c => c.textContent || '').join(''); },
+		set(v) { node.children.length = 0; node.own = v == null ? '' : String(v); },
+	});
+	Object.defineProperty(node, 'firstChild', { get: () => node.children[0] || null });
+	// A select is not a box that keeps whatever is put in it. A value no option
+	// carries is dropped, and a select with nothing chosen shows its first option.
+	// As a plain property it kept the value, and the import window passed here while
+	// in a browser it opened on the first format in its list — GeckoLib — whatever
+	// was chosen the time before, because the window assigns the value before the
+	// options exist. This is the one place the fake has to behave like a browser.
+	if (node.tagName === 'SELECT') {
+		let chosen = '';
+		const options = () => node.children.filter(c => c.tagName === 'OPTION');
+		Object.defineProperty(node, 'value', {
+			get() {
+				const list = options();
+				if (chosen && list.some(o => o.value === chosen)) return chosen;
+				return list.length ? list[0].value : '';
+			},
+			set(v) { chosen = options().some(o => o.value === String(v)) ? String(v) : ''; },
+		});
+	}
+	node.appendChild = child => {
+		if (child.parentNode) child.parentNode.removeChild(child);
+		child.parentNode = node;
+		node.children.push(child);
+		return child;
+	};
+	node.removeChild = child => {
+		const at = node.children.indexOf(child);
+		if (at >= 0) node.children.splice(at, 1);
+		child.parentNode = null;
+		return child;
+	};
+	node.remove = () => { if (node.parentNode) node.parentNode.removeChild(node); };
+	node.append = (...kids) => { for (const k of kids) node.appendChild(k); };
+	node.setAttribute = (k, v) => { node.attrs[k] = String(v); };
+	node.getAttribute = k => (k in node.attrs ? node.attrs[k] : null);
+	node.addEventListener = (kind, fn) => { (node.handlers[kind] = node.handlers[kind] || []).push(fn); };
+	node.removeEventListener = (kind, fn) => {
+		node.handlers[kind] = (node.handlers[kind] || []).filter(f => f !== fn);
+	};
+	node.dispatchEvent = e => { for (const fn of node.handlers[e.type] || []) fn(e); return true; };
+	// A checkbox answers a click by flipping and saying so. Both events, because the
+	// window listens for change: setting `checked` by hand would leave it unaware,
+	// and then a test would read a window no person could have put in that state.
+	node.click = () => {
+		if (node.tagName === 'INPUT' && node.type === 'checkbox') {
+			node.checked = !node.checked;
+			node.dispatchEvent(fakeEvent('click'));
+			node.dispatchEvent(fakeEvent('change'));
+			return true;
+		}
+		return node.dispatchEvent(fakeEvent('click'));
+	};
+	node.focus = () => { };
+	node.blur = () => { };
+	node.getBoundingClientRect = () => ({ left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 });
+	node.querySelector = sel => node.querySelectorAll(sel)[0] || null;
+	node.querySelectorAll = sel => {
+		let found = [node];
+		for (const step of String(sel).trim().split(/\s+/)) {
+			const next = [];
+			for (const one of found) {
+				for (const deep of descendants(one)) if (selectorHits(deep, step) && !next.includes(deep)) next.push(deep);
+			}
+			found = next;
+		}
+		return found;
+	};
+	return node;
+}
+
 /** A canvas that remembers its size and what was drawn on it, and where. */
 function fakeCanvas() {
-	const c = { width: 0, height: 0, draws: [] };
+	const c = fakeNode('canvas');
+	c.width = 0;
+	c.height = 0;
+	c.draws = [];
 	// blocks of ready pixels are counted: the baked sheets of rebuilt parts arrive that way
 	c.puts = 0;
 	c.getContext = () => ({
@@ -218,6 +526,33 @@ function fakeCanvas() {
 	c.toDataURL = () => 'data:image/png;base64,AAAA';
 	canvasLog.push(c);
 	return c;
+}
+
+/**
+ * A control of the import window, found by the icon of the row it sits in.
+ *
+ * By the icon and not by its place in the window: the icon is part of what a row
+ * means and stays with it when the layout moves, while an index into the controls
+ * would break on every cosmetic change.
+ */
+function controlsByIcon(root, icon, kind) {
+	const out = [];
+	for (const node of descendants(root)) {
+		if (node.tagName !== 'I' || node.own !== icon) continue;
+		let up = node.parentNode;
+		for (let step = 0; step < 3 && up; step++, up = up.parentNode) {
+			const found = descendants(up).find(n => n.tagName === String(kind).toUpperCase());
+			if (found) { if (!out.includes(found)) out.push(found); break; }
+		}
+	}
+	return out;
+}
+
+/** The button of one of the two shapes, told apart by the icon it carries. */
+function tileByIcon(root, icon) {
+	const pick = root.querySelector('.mtc_imp_pick');
+	if (!pick) return null;
+	return pick.children.find(b => descendants(b).some(n => n.tagName === 'I' && n.own === icon)) || null;
 }
 
 
@@ -441,22 +776,47 @@ function zipContents() {
 }
 
 
-// A pseudo-DOM for the report window: checks that the "Save log" and
-// "Copy" buttons are found by their classes and the handlers get attached.
-const foundSelectors = [];
+// A pseudo-DOM for a window that is handed ready-made markup: the progress window is
+// the last of them, and it only reaches in for the bar and the line of text above it.
+// A class the markup does not carry gives null, as a real querySelector would.
 function fakeDialogRoot(html) {
 	return {
 		querySelector(sel) {
-			foundSelectors.push(sel);
 			if (html.indexOf(sel.replace('.', '')) < 0) return null;
 			return { addEventListener() { }, textContent: '' };
 		},
 	};
 }
 
+/**
+ * Watches a window's tree so that its words can be read after it was handed over.
+ *
+ * Blockbench gives the window its root, and only then does the window build itself
+ * into it — so there is no one moment at which the tree is finished. Every append
+ * anywhere under the root writes the text down again, and the last one leaves the
+ * whole of it. Cheaper than it sounds: `textContent` on a fakeNode is a getter over
+ * the children, and the report is a few dozen nodes.
+ */
+function watchTree(node, root, write) {
+	if (node.__watched) return;
+	node.__watched = true;
+	const append = node.appendChild;
+	node.appendChild = child => {
+		const out = append(child);
+		watchTree(child, root, write);
+		write(root.textContent);
+		return out;
+	};
+	for (const kid of node.children) watchTree(kid, root, write);
+}
+
 const sandboxActions = [];
 const menuPlacement = {};
 let lastDialog = null;
+// The import window, left standing so the test can work it, and what it offered
+// while it stood: the window has no form to read the settings back out of.
+let importWindow = null;
+let windowOffered = {};
 // Every form dialog shown, by id: the CPM dialog's questions are checked below.
 const formsShown = {};
 // Fields the import dialog is confirmed with instead of its defaults.
@@ -475,25 +835,59 @@ for (const [key, from] of [['rotation_limit', '1.21.11'], ['rotation_snap', '1.2
 		},
 	});
 }
+// `meshes` is Blockbench's own flag, and of the formats the import can build into
+// only Generic Model carries it: the rest are boxes. The window reads that flag to
+// decide whether the model may open as meshes at all.
 const ALL_FORMATS = {
 	geckolib_model: { id: 'geckolib_model' },
 	bedrock: { id: 'bedrock' },
-	free: { id: 'free' },
+	free: { id: 'free', meshes: true },
 	java_block: javaFormat,
 };
 let zipWritten = null;
 let exported = null;
 
+/** Every animation file that reached the editor's own reader, as it reached it. */
+const animationsRead = [];
+/**
+ * Blockbench's codecs, in the sandbox from the start.
+ *
+ * They exist before any plugin loads in a real editor, and the plugin wraps the
+ * animation reader in `onload()` — a codec made later would never be the object it
+ * wrapped, and the wrapping would go unmeasured. What each codec writes is stubbed;
+ * what it is handed is the thing these checks are about.
+ */
+const animationCodec = {
+	id: 'bedrock_animation',
+	compileFile() { return '{}'; },
+	loadFile(file) { animationsRead.push(file && (file.json || file.content)); return []; },
+};
+const CODECS = {
+	project: { id: 'project' },
+	bedrock: {
+		id: 'bedrock',
+		format: { animation_codec: animationCodec },
+		compile() { return '{"format_version":"1.12.0"}'; },
+		// Without the `.geo`, the way the editor's own hands it over: the plugin is the
+		// one that has to put it there, and this is where that is seen.
+		fileName() { return 'probe'; },
+	},
+};
+
 const sandbox = {
 	console, JSON, Math, Object, Array, String, Number, Boolean, Error, isFinite, parseInt, parseFloat,
 	Set, Map, Promise, TextDecoder, Uint8Array, DataView, ArrayBuffer, Buffer,
+	// The import window hands the browser a moment before it reads a large model,
+	// so that it can say it is reading rather than stand there with nothing in it.
+	setTimeout, clearTimeout,
 	btoa: s => Buffer.from(s, 'binary').toString('base64'),
 	atob: s => Buffer.from(s, 'base64').toString('binary'),
 	THREE, Cube, Group, Animation, Texture,
-	Mesh: { all: [] },
+	Mesh, MeshFace,
 	Canvas: { updateAll() { }, updateUV() { }, updateAllBones() { }, updateView() { } },
 	Project: { box_uv: true, texture_width: 16, texture_height: 16 },
 	Formats: ALL_FORMATS,
+	Codecs: CODECS,
 	// Records which format each import built into. A Java project starts on the
 	// 1.21.6 format, as it does when the user's settings target that Minecraft:
 	// too old for cubes turned on several axes, so the import has to raise it.
@@ -512,7 +906,19 @@ const sandbox = {
 	Timeline: { setTime() { } },
 	Animator: { preview() { } },
 	Modes: { options: { edit: { select() { } } } },
-	ModelFormat: class { constructor(d) { Object.assign(this, d); } delete() { } },
+	// Blockbench's own writes itself into `Formats`, and takes either an id with its
+	// options or one object carrying the id. Both forms are in use — the start screen
+	// entry passes one object, the GeckoLib registration passes both, since builds
+	// differ in which of the two they read — and a stub that kept out of the registry
+	// would answer "no such format" to a plugin that had just registered one.
+	ModelFormat: class {
+		constructor(id, opts) {
+			if (typeof id === 'string') { Object.assign(this, opts || {}); this.id = id; }
+			else Object.assign(this, id || {});
+			if (this.id) sandbox.Formats[this.id] = this;
+		}
+		delete() { if (this.id && sandbox.Formats[this.id] === this) delete sandbox.Formats[this.id]; }
+	},
 	Plugin: { register(id, opts) { sandbox.__plugin = opts; } },
 	Action: class {
 		constructor(id, opts) { Object.assign(this, opts); this.id = id; sandboxActions.push(this); }
@@ -520,14 +926,62 @@ const sandbox = {
 	},
 	// Records where the plugin puts its entries: the catalog maintainer asked to
 	// move them from the bottom of the File menu into File > Import, and undoing that must be caught.
-	MenuBar: { addAction(action, where) { menuPlacement[action.id] = where; } },
+	MenuBar: {
+		addAction(action, where) { menuPlacement[action.id] = where; },
+		// the "open" group of Blockbench's File menu, as 5.2 lays it out
+		menus: { file: { structure: ['file_options', 'project_window', 'open', 'new', 'recent', 'open_model', 'open_from_link', 'new_window', 'project'] } },
+	},
 	Dialog: class {
 		constructor(opts) { Object.assign(this, opts); }
 		show() {
-			// The report window has no form: it has ready-made markup in lines.
-			// That has to be checked too — it is where the import report moved.
+			// The import window: a tree of its own, built into the markup Blockbench
+			// is handed. It cannot confirm itself here — there is no model in it yet —
+			// so it is left standing and driven from runImport below, the way a person
+			// drives it: choose the files, wait for the reading, press Import.
+			if (/_import_dialog$/.test(this.id || '')) {
+				const root = fakeNode('div');
+				const where = fakeNode('div');
+				where.className = 'mtc_imp_host';
+				root.appendChild(where);
+				const confirm = fakeNode('button');
+				confirm.className = 'confirm_btn';
+				root.appendChild(confirm);
+				this.object = root;
+				importWindow = this;
+				lastDialog = this;
+				return;
+			}
+			// The progress window carries ready-made markup as well, but it is not the
+			// report: it stands while the work runs, and the work drives its bar through
+			// the tree. Deliberately not written down as the report — the checks below
+			// wait for the report, and a progress window would end that wait at the start.
+			if (/_progress$/.test(this.id || '')) {
+				this.object = fakeDialogRoot(this.lines.join(String.fromCharCode(10)));
+				lastDialog = this;
+				return;
+			}
+			// The report: a tree of its own as well, since it was rebuilt out of nodes.
+			// Its words used to be in `lines` and could be read the moment the window
+			// was shown; `lines` now holds the empty host it builds into, so the words
+			// are taken off the tree, and taken again after every append — the window
+			// fills itself after Blockbench has handed it the root.
+			if (/_report$/.test(this.id || '')) {
+				const root = fakeNode('div');
+				const where = fakeNode('div');
+				where.className = 'mtc_rep_host';
+				root.appendChild(where);
+				this.object = root;
+				reportTree = root;
+				// Silent on purpose: a line per append would be twenty lines of a window
+				// half-built. SMOKE_DEBUG prints it once, where the run waits for it.
+				watchTree(root, root, text => { reportShown = text; });
+				lastDialog = this;
+				return;
+			}
+			// Anything else carrying ready-made markup.
 			if (this.lines && this.lines.length) {
 				reportShown = this.lines.join(String.fromCharCode(10));
+				if (process.env.SMOKE_DEBUG) console.log('[lines] ' + reportShown.slice(0, 160).replace(/\s+/g, ' '));
 				this.object = fakeDialogRoot(reportShown);
 				lastDialog = this;
 				return;
@@ -547,7 +1001,10 @@ const sandbox = {
 	},
 	Blockbench: {
 		version: 'smoke',
-		showMessageBox(o) { reportShown = o.message; },
+		showMessageBox(o) {
+			if (process.env.SMOKE_DEBUG) console.log('[msgbox] ' + String(o.message).slice(0, 160).replace(/\s+/g, ' '));
+			reportShown = o.message;
+		},
 		showQuickMessage() { },
 		addCSS: () => ({ delete() { } }),
 		on() { }, removeListener() { },
@@ -592,10 +1049,9 @@ const sandbox = {
 		}
 	},
 	document: {
+		body: fakeNode('body'),
 		querySelector: () => null,
-		createElement: (tag) => tag === 'canvas'
-			? fakeCanvas()
-			: { style: {}, classList: { add() { } }, addEventListener() { } },
+		createElement: (tag) => (tag === 'canvas' ? fakeCanvas() : fakeNode(tag)),
 	},
 	Image: class { set src(v) { this._src = v; setTimeout(() => this.onload && this.onload(), 0); } },
 	localStorage: { _v: {}, getItem(k) { return this._v[k] || null; }, setItem(k, v) { this._v[k] = v; } },
@@ -610,20 +1066,33 @@ const src = fs.readFileSync(path.join('plugin', 'gltf_to_minecraft.js'), 'utf8')
 vm.createContext(sandbox);
 
 let failed = false;
+
+// A promise nobody caught is a failure of this run, not a reason to end it. The
+// window reads the model and builds its picture in promises of its own, and a
+// throw in one of those used to stop node where it stood — with every scenario
+// after it never run, and only a stack to say what happened.
+const loose = [];
+process.on('unhandledRejection', e => {
+	failed = true;
+	loose.push(e);
+	console.log(`FAIL: nobody caught: ${e && e.message ? e.message : e}`
+		+ (e && e.stack ? '\n' + e.stack.split('\n').slice(1, 3).join('\n') : ''));
+});
+
 try {
 	new vm.Script(src, { filename: 'gltf_to_minecraft.js' }).runInContext(sandbox);
 } catch (e) {
-	console.log(`\n❌ The plugin crashed on load: ${e.message}\n${e.stack.split('\n').slice(1, 3).join('\n')}`);
+	console.log(`\nFAIL: The plugin crashed on load: ${e.message}\n${e.stack.split('\n').slice(1, 3).join('\n')}`);
 	process.exit(1);
 }
 
 const plugin = sandbox.__plugin;
-if (!plugin) { console.log('\n❌ Plugin.register was not called\n'); process.exit(1); }
+if (!plugin) { console.log('\nFAIL: Plugin.register was not called\n'); process.exit(1); }
 
 try {
 	plugin.onload();
 } catch (e) {
-	console.log(`\n❌ onload crashed: ${e.message}\n${e.stack.split('\n').slice(1, 3).join('\n')}`);
+	console.log(`\nFAIL: onload crashed: ${e.message}\n${e.stack.split('\n').slice(1, 3).join('\n')}`);
 	process.exit(1);
 }
 
@@ -632,6 +1101,10 @@ console.log('=== PLUGIN SMOKE TEST ===');
 console.log('');
 console.log('The plugin loaded and onload ran: OK');
 console.log(`Actions registered: ${sandboxActions.length}`);
+// The window's picture is built here but not drawn: the mini-THREE above keeps a
+// scene graph and no renderer. So the calls that build the scene and take it apart
+// are checked, and how the model looks is not — that is looked at in a real
+// Blockbench, and nothing here can stand in for it.
 
 // The import is run through the created action: the dialog confirms itself,
 // JSZip hands over files from disk. That way the whole path is checked end to end.
@@ -649,7 +1122,7 @@ if (!importAction) { console.log('ERROR: import action not found'); process.exit
     });
     if (misplaced.length) {
         failed = true;
-        console.log('❌ not in File > Import: ' + misplaced.join(', ')
+        console.log('FAIL: not in File > Import: ' + misplaced.join(', ')
             + ' (' + misplaced.map(s => {
                 const a = sandboxActions.find(x => x.id.endsWith(s));
                 return a ? menuPlacement[a.id] : 'no action';
@@ -657,41 +1130,166 @@ if (!importAction) { console.log('ERROR: import action not found'); process.exit
     } else {
         console.log('All three entries sit in File > Import: OK');
     }
+    // The site's models open as projects of their own, so that entry goes right
+    // after Open from Link (index 6 in the stub's File menu), not among the imports.
+    const models = sandboxActions.find(x => x.id.endsWith('_models'));
+    if (!models || menuPlacement[models.id] !== 'file.7') {
+        failed = true;
+        console.log('FAIL: the models window is not in the File menu\'s open group ('
+            + (models ? menuPlacement[models.id] : 'no action') + ')');
+    } else {
+        console.log('The models window sits in File, beside Open Model: OK');
+    }
 }
 
-/** One full import run: the dialog confirms itself, JSZip hands over the fixture. */
+/** Waits for something to become true, and gives up after a while. */
+async function until(done, most) {
+    const till = Date.now() + most;
+    while (!done() && Date.now() < till) await new Promise(r => setTimeout(r, 25));
+    return !!done();
+}
+
+/**
+ * The import window, worked the way a person works it: the shape chosen, the
+ * files chosen inside the window, the reading waited out, the settings set,
+ * Import pressed. The window no longer confirms itself — with no model in it
+ * there is nothing to build — so every step is taken here.
+ *
+ * `confirm: false` leaves the window standing, for the checks that only want to
+ * see what it offers; `stays: true` says that pressing Import should keep it open
+ * — a format that needs a plugin is told about without the window going away.
+ */
+async function driveImportWindow(opts = {}) {
+    const dialog = importWindow;
+    if (!dialog) throw new Error('the import window never opened');
+    const where = dialog.object.querySelector('.mtc_imp_host');
+    if (!where || !where.children.length) throw new Error('the import window was left empty');
+    const win = where.children[0];
+
+    // The shape is pressed outright, cubes included: the window keeps the last choice
+    // on purpose, so a run that says nothing would inherit whatever the run before it
+    // chose. Where only cubes are offered there is no button, and none is needed.
+    const wanted = formOverride.shape === 'mesh' ? 'mesh' : 'cubes';
+    const tile = tileByIcon(win, wanted === 'mesh' ? 'change_history' : 'view_in_ar');
+    if (wanted === 'mesh') {
+        if (!tile) throw new Error('meshes cannot be chosen');
+        if (tile.disabled) throw new Error('the meshes button is dead: no format holds them');
+    }
+    if (tile && !tile.disabled) tile.click();
+
+    const choose = win.querySelector('.mtc_btn.main');
+    if (!choose) throw new Error('the window offers no way to choose files');
+    choose.click();
+    // Blockbench.import answers at once, gatherModelFiles over a promise, and the
+    // window puts the reading behind a timeout so it can say that it is reading.
+    // Waited out by what the window shows, not by the clock: it goes on to say
+    // either that it is ready to build or what went wrong.
+    const confirmable = () => dialog.object.querySelector('.confirm_btn');
+    const read = await until(() => {
+        const button = confirmable();
+        return (button && button.disabled === false) || !!win.querySelector('.mtc_imp_drop .mtc_note.bad');
+    }, 8000);
+    if (!read) throw new Error('the window neither read the model nor said why');
+    const trouble = win.querySelector('.mtc_imp_drop .mtc_note.bad');
+    if (trouble) throw new Error('the window refuses the model: ' + trouble.textContent);
+
+    // Chosen, then said out loud: the window repaints on change, and a value set
+    // silently would leave the rest of it showing the old format.
+    const chooser = controlsByIcon(win, 'inventory_2', 'select')[0] || null;
+    if (formOverride.target) {
+        if (!chooser) throw new Error('the format cannot be chosen');
+        chooser.value = formOverride.target;
+        chooser.dispatchEvent(fakeEvent('change'));
+    }
+    // Both boxes carry the same icon — one adds the model to the open project, the
+    // other its animations — and they stand in that order, format before animations.
+    const adders = controlsByIcon(win, 'playlist_add', 'input');
+    if (formOverride.add_to_open) {
+        if (!adders[0]) throw new Error('adding to the open project is not offered');
+        if (!adders[0].checked) adders[0].click();
+    }
+    if (formOverride.add_animations) {
+        if (!adders[1]) throw new Error('the animations of an added model are not offered');
+        if (!adders[1].checked) adders[1].click();
+    }
+    // What the window held out, for the checks below: the dialog has no form to
+    // read any more, so what it offered is written down while it is still open.
+    windowOffered = {
+        adding: !!adders[0],
+        // The choice of shape: left out entirely where only cubes will do.
+        shapes: !!tileByIcon(win, 'change_history'),
+        // Beside the box, not under it: the long explanation moved onto an icon.
+        aboutAdding: adders[0] && adders[0].parentNode && adders[0].parentNode.parentNode
+            ? (adders[0].parentNode.parentNode.querySelector('.mtc_tip') || { textContent: '' }).textContent
+            : '',
+        targets: chooser ? chooser.children.map(o => o.value) : [],
+        target: chooser ? chooser.value : '',
+    };
+    // Not simply abandoned: closed through Cancel, so the window lets go of the
+    // preview the way it does for a person who changes their mind.
+    if (opts.confirm === false) { dialog.onCancel(); return; }
+    // false means the window kept itself open: it would not build what was asked.
+    const kept = dialog.onConfirm() === false;
+    if (kept !== !!opts.stays) {
+        throw new Error(kept
+            ? 'the window would not build what was asked of it'
+            : 'the window built what it should have refused, and closed');
+    }
+}
+
+/** One full import run: the window is worked through, JSZip hands over the fixture. */
 async function runImport(label) {
     created.cubes.length = 0;
     created.groups.length = 0;
     created.animations.length = 0;
     created.textures.length = 0;
+    created.meshes.length = 0;
     problems.length = 0;
     reportShown = null;
+    reportTree = null;
+    importWindow = null;
 
     console.log('');
     console.log('--- ' + label);
     try {
         importAction.click();
+        await driveImportWindow();
     } catch (e) {
         console.log('ERROR during import: ' + e.message);
         console.log(String(e.stack).split(String.fromCharCode(10)).slice(1, 4).join(' | '));
         process.exit(1);
     }
-    await new Promise(r => setTimeout(r, 300));
+    // Waited out rather than slept through: the building is a chain of promises
+    // whose length depends on the model, and a fixed pause either wastes time or
+    // reads the result before it is there. Generous, because rebuilding a rounded
+    // part from plates takes seconds on a real model, and the wait ends the moment
+    // the report is up.
+    //
+    // By the report and not by the first cube: the import puts probe cubes in and
+    // takes them out again while it measures Blockbench, so a count of cubes goes
+    // up and back to nothing in the middle of a run.
+    await until(() => reportShown, 60000);
+    await new Promise(r => setTimeout(r, 60));
+    if (process.env.SMOKE_DEBUG) console.log('[report] ' + String(reportShown).slice(0, 300).replace(/\s+/g, ' '));
 
     let bad = false;
-    if (created.cubes.length) {
+    // Cubes or meshes: the window offers both shapes, and a mesh import makes no
+    // cubes at all, so a count of cubes alone would call it a failure.
+    if (created.cubes.length || created.meshes.length) {
         const kf = created.animations.reduce((s, a) =>
             s + Object.values(a.animators).reduce((n, an) => n + an.rotation.length + an.position.length, 0), 0);
-        console.log(`Cubes ${created.cubes.length}, bones ${created.groups.length}, `
+        const shape = created.meshes.length
+            ? `Meshes ${created.meshes.length}, faces ${created.meshes.reduce((s, m) => s + Object.keys(m.faces || {}).length, 0)}`
+            : `Cubes ${created.cubes.length}`;
+        console.log(`${shape}, bones ${created.groups.length}, `
             + `animations ${created.animations.length}, keyframes ${kf}`);
     } else {
         bad = true;
-        console.log('❌ not a single cube was created');
+        console.log('FAIL: nothing was created, neither cubes nor meshes');
     }
     if (problems.length) {
         bad = true;
-        console.log(`❌ Problems (${problems.length}):`);
+        console.log(`FAIL: Problems (${problems.length}):`);
         for (const p of problems.slice(0, 5)) console.log('  ' + p);
     }
     // This check used to look for Russian words, and went dead the day the plugin's
@@ -699,7 +1297,7 @@ async function runImport(label) {
     // always says "failed: 0" on a healthy run, so only a non-zero count counts.
     if (reportShown && /Animations transferred: \d+, failed: [1-9]|not transferred:/.test(reportShown)) {
         bad = true;
-        console.log('❌ The report says something failed:' + String.fromCharCode(10) + reportShown.slice(0, 400));
+        console.log('FAIL: The report says something failed:' + String.fromCharCode(10) + reportShown.slice(0, 400));
     }
     return bad;
 }
@@ -730,7 +1328,7 @@ failed = await runImport('archive with JPEG + an unreadable image') || failed;
 
 if (created.cubes.length !== cubesPNG) {
     failed = true;
-    console.log(`❌ JPEG gave ${created.cubes.length} cubes instead of ${cubesPNG}`);
+    console.log(`FAIL: JPEG gave ${created.cubes.length} cubes instead of ${cubesPNG}`);
 }
 // The report window buttons must be found by their classes: if the markup and
 // the handlers drift apart, "Save log" will silently stop working.
@@ -753,28 +1351,60 @@ for (const c of created.cubes) {
 }
 if (flatWithSides) {
 	failed = true;
-	console.log('❌ inflated flat cubes kept their side faces: ' + flatWithSides);
+	console.log('FAIL: inflated flat cubes kept their side faces: ' + flatWithSides);
 } else if (!flatInflated) {
 	// A check with nothing to check stays as quiet as working code.
-	console.log('⚠ no inflated flat cubes in the fixture — the outline check ran idle');
+	console.log('WARN: no inflated flat cubes in the fixture — the outline check ran idle');
 } else {
 	console.log(`Flat cubes got no side faces when inflated: OK (checked ${flatInflated})`);
 }
 
-for (const sel of ['.mtc_rep_save', '.mtc_rep_copy']) {
-	if (!foundSelectors.includes(sel)) {
-		failed = true;
-		console.log('❌ no handler attached to ' + sel);
-	}
-}
-if (reportShown && reportShown.indexOf('mtc_rep_log') < 0) {
+// The report's own parts, in the tree rather than in a string of markup: the log, the
+// press that reveals it, and the two buttons under it. Saving and copying used to be
+// checked by whether the window had looked their classes up; the buttons are built as
+// nodes now, so what is checked is that they are there and that a press would reach a
+// handler at all.
+if (!reportTree) {
 	failed = true;
-	console.log('❌ the report window has no scrollable log block');
+	console.log('FAIL: the report window built no tree');
+} else {
+	const log = reportTree.querySelector('.mtc_rep_log');
+	const fold = reportTree.querySelectorAll('button.mtc_btn')
+		.find(b => (b.querySelector('i') || { textContent: '' }).textContent === 'expand_more');
+	if (!log) {
+		failed = true;
+		console.log('FAIL: the report window has no scrollable log block');
+	} else if (!fold) {
+		failed = true;
+		console.log('FAIL: nothing in the report window opens the log');
+	} else if (log.style.display !== 'none') {
+		failed = true;
+		console.log('FAIL: the report window opens with its log unfolded');
+	} else {
+		fold.click();
+		if (log.style.display === 'none') {
+			failed = true;
+			console.log('FAIL: the log stayed hidden after the fold was pressed');
+		} else {
+			console.log('The report keeps its log folded and the press opens it: OK');
+		}
+	}
+	for (const [icon, what] of [['save_alt', 'saving the log'], ['content_copy', 'copying the log']]) {
+		const button = reportTree.querySelectorAll('button.mtc_btn')
+			.find(b => (b.querySelector('i') || { textContent: '' }).textContent === icon);
+		if (!button) {
+			failed = true;
+			console.log('FAIL: the report window does not offer ' + what);
+		} else if (!(button.handlers.click || []).length) {
+			failed = true;
+			console.log('FAIL: no handler attached to ' + what);
+		}
+	}
 }
 
 if (!reportShown || reportShown.indexOf('Images skipped: 1') < 0) {
     failed = true;
-    console.log('❌ the report has no line about the skipped image (Images skipped)');
+    console.log('FAIL: the report has no line about the skipped image (Images skipped)');
 } else {
     console.log('Unreadable image noted in the report, image indices renumbered: OK');
 }
@@ -790,28 +1420,39 @@ failed = await runImport('archive with an image nobody refers to') || failed;
 
 if (created.cubes.length !== cubesPNG) {
     failed = true;
-    console.log(`❌ the extra image changed the parse: ${created.cubes.length} cubes instead of ${cubesPNG}`);
+    console.log(`FAIL: the extra image changed the parse: ${created.cubes.length} cubes instead of ${cubesPNG}`);
 }
 const atlasNamed = created.textures.filter(t => t.name === 'atlas.png').length;
 if (atlasNamed) {
     failed = true;
-    console.log('❌ the unreachable image got into the atlas after all');
+    console.log('FAIL: the unreachable image got into the atlas after all');
 } else {
     console.log('The unreachable image stayed out of the atlas: OK');
 }
 if (!reportShown || reportShown.indexOf('Colour textures no mesh references: 1') < 0) {
     failed = true;
-    console.log('❌ the report has no line about the image nobody refers to');
+    console.log('FAIL: the report has no line about the image nobody refers to');
 } else {
     console.log('The report names the image nobody refers to: OK');
 }
 // Every part on one texture while another lies unused is a file that lost its
 // material links, and that is said up front, in the report's warning box.
-if (!reportShown || !/class="mtc_rep_warn">Every part of this file points at one texture/.test(reportShown)) {
+const warned = reportTree
+    ? reportTree.querySelectorAll('.mtc_rep_warn')
+        .some(box => box.textContent.includes('Every part of this file points at one texture'))
+    : false;
+if (!warned) {
     failed = true;
-    console.log('❌ the report does not warn that the file lost its material links');
+    console.log('FAIL: the report does not warn that the file lost its material links');
 } else {
     console.log('The report warns that the file lost its material links: OK');
+}
+// And says it in the mark at the top as well, before anything is read: an import with
+// something to answer for is not greeted by a tick.
+const headIcon = reportTree && reportTree.querySelector('.mtc_rep_head i');
+if (!headIcon || headIcon.textContent !== 'warning') {
+    failed = true;
+    console.log(`FAIL: the report's own mark is "${headIcon ? headIcon.textContent : 'nothing'}" on an import that warns`);
 }
 
 // --- objects that name no image at all: the UV must not spread across the atlas.
@@ -838,10 +1479,10 @@ for (const c of created.cubes) {
 }
 if (!uvCount) {
     failed = true;
-    console.log('❌ nothing to check: not a single face with UV');
+    console.log('FAIL: nothing to check: not a single face with UV');
 } else if (uvMax > 384.5 || uvMin < 255.5) {
     failed = true;
-    console.log(`❌ UV of objects without a material spread across the atlas: ${uvMin.toFixed(1)}..${uvMax.toFixed(1)}`
+    console.log(`FAIL: UV of objects without a material spread across the atlas: ${uvMin.toFixed(1)}..${uvMax.toFixed(1)}`
         + ' instead of 256..384');
 } else {
     console.log(`UV of objects without a material landed in the main image's rectangle: OK `
@@ -859,7 +1500,7 @@ failed = await runImport('files of an unpacked folder, no archive') || failed;
 
 if (created.cubes.length !== cubesPNG) {
     failed = true;
-    console.log(`❌ the folder gave ${created.cubes.length} cubes instead of ${cubesPNG}`);
+    console.log(`FAIL: the folder gave ${created.cubes.length} cubes instead of ${cubesPNG}`);
 } else {
     console.log(`The folder gave the same result as the archive: OK (${cubesPNG} cubes)`);
 }
@@ -872,10 +1513,10 @@ failed = await runImport('folder files, where glTF refers through textures/') ||
 
 if (created.cubes.length !== cubesPNG) {
     failed = true;
-    console.log(`❌ the folder gave ${created.cubes.length} cubes instead of ${cubesPNG}`);
+    console.log(`FAIL: the folder gave ${created.cubes.length} cubes instead of ${cubesPNG}`);
 } else if (reportShown && reportShown.indexOf('not found in the archive') >= 0) {
     failed = true;
-    console.log('❌ the image was not found by its bare name, without the subfolder');
+    console.log('FAIL: the image was not found by its bare name, without the subfolder');
 } else {
     console.log('Images found by file name, without the path: OK');
 }
@@ -887,7 +1528,7 @@ failed = await runImport('the material asks for transparency, the texture does n
 
 if (!reportShown || reportShown.indexOf('has no alpha channel') < 0) {
     failed = true;
-    console.log('❌ the report has no line about the lost alpha');
+    console.log('FAIL: the report has no line about the lost alpha');
 } else {
     console.log('The report names the lost alpha: OK');
 }
@@ -932,7 +1573,7 @@ failed = await runImport('every mesh starts with an untextured face') || failed;
     const size = [sandbox.Project.texture_width, sandbox.Project.texture_height].join('×');
     if (size !== texturePNG) bad.push(`the texture changed from ${texturePNG} to ${size}: the placeholder decided the atlas`);
     if (!/Faces with no texture: \d+ kept hidden/.test(reportShown || '')) bad.push('the report does not mention the hidden faces');
-    if (bad.length) { failed = true; console.log('❌ ' + bad.join('; ')); }
+    if (bad.length) { failed = true; console.log('FAIL: ' + bad.join('; ')); }
     else console.log(`Solid cubes read the same texture as without the placeholder, nothing reads outside it, texture ${size}: OK`);
 }
 
@@ -959,7 +1600,7 @@ for (let i = 0; i < 100 && !/Rebuilt, /.test(reportShown || ''); i++) await new 
         .filter(f => f.texture && f.uv && f.uv.some((v, k) => v < -1e-6 || v > (k % 2 ? th : tw) + 1e-6)).length, 0);
     if (outside) bad.push(`${outside} faces read outside the texture`);
     if (tw * th <= atlasPNG[0] * atlasPNG[1]) bad.push(`the texture did not grow for the sheets: ${tw}×${th}`);
-    if (bad.length) { failed = true; console.log('❌ ' + bad.join('; ')); }
+    if (bad.length) { failed = true; console.log('FAIL: ' + bad.join('; ')); }
     else console.log(`The prism came back as 14 plates, two-sided, their sheets in a ${tw}×${th} texture: OK`);
 }
 scenario = 'png';
@@ -993,10 +1634,70 @@ for (const target of ['bedrock', 'free', 'java_block']) {
         if (free && version !== '1.21.11') bad.push(`${free} freely turned cubes, but the format stayed at ${version}`);
         console.log(`Java: ${free} freely turned cubes, format ${version}`);
     }
-    if (bad.length) { failed = true; console.log(`❌ ${target}: ${bad.join('; ')}`); }
+    if (bad.length) { failed = true; console.log(`FAIL: ${target}: ${bad.join('; ')}`); }
     else console.log(`Built into ${target}: OK`);
 }
 formOverride = {};
+
+// --- opened as meshes instead of being rebuilt into cubes. The triangles of the
+// file become the triangles of the model, so nothing is approximated and nothing
+// is a box; the price is that only Generic Model holds them.
+{
+    formOverride = { shape: 'mesh', target: 'free' };
+    failed = await runImport('opened as meshes, not rebuilt into cubes') || failed;
+    const bad = [];
+    if (created.cubes.length) bad.push(`${created.cubes.length} cubes were made as well`);
+    if (!created.meshes.length) bad.push('not a single mesh');
+    const faces = created.meshes.reduce((s, m) => s + Object.keys(m.faces || {}).length, 0);
+    const corners = created.meshes.reduce((s, m) => s + Object.keys(m.vertices || {}).length, 0);
+    // Welded, not scattered: a triangle soup would give three corners per face, and
+    // then every edge would be a seam no one can drag.
+    if (corners >= faces * 3) bad.push(`${corners} corners for ${faces} faces: the vertices were not welded`);
+    // A painted face has to give UV for every corner it names: a mesh keeps them
+    // per vertex, not as a rectangle, so one missing corner smears the triangle.
+    let painted = 0, lameUV = 0;
+    for (const m of created.meshes) {
+        for (const f of Object.values(m.faces || {})) {
+            if (!f.texture) continue;
+            painted++;
+            if (!f.uv || f.vertices.some(k => !f.uv[k])) lameUV++;
+        }
+    }
+    if (!painted) bad.push('not one face carries a texture');
+    if (lameUV) bad.push(`${lameUV} painted faces leave a corner without UV`);
+    // Every face names its corners by the keys of its own mesh, or it draws nothing.
+    const strayFace = created.meshes.some(m => Object.values(m.faces || {}).some(f =>
+        !Array.isArray(f.vertices) || f.vertices.some(k => !(m.vertices || {})[k])));
+    if (strayFace) bad.push('a face names a corner its mesh does not have');
+    if (created.groups.length < 2) bad.push('the meshes were not hung on the model\'s folders');
+    if (!/Meshes made: \d+/.test(reportShown || '')) bad.push('the report does not say how many meshes');
+    if (bad.length) { failed = true; console.log('FAIL: meshes: ' + bad.join('; ')); }
+    else console.log(`Opened as meshes: ${created.meshes.length} meshes, ${faces} faces, ${corners} welded corners: OK`);
+    formOverride = {};
+}
+
+// --- the window's own picture of the model: built, and let go of again.
+//
+// Not what it looks like — there is no renderer here. What is checked is that the
+// scene is built out of calls that exist and comes apart leaving nothing behind.
+// This exists because it once did not: the ground was built through a class whose
+// signature Blockbench changes, so disposing of it threw, and the throw ran before
+// hide() — in a real Blockbench the window could neither close nor import. A test
+// with no scene graph could not see it, because the figure was never built.
+{
+    const gone = await until(() => !glLive.geometry && !glLive.material && !glLive.texture, 2000);
+    if (!glMade.geometry) {
+        failed = true;
+        console.log('FAIL: the window never built a picture of the model');
+    } else if (!gone) {
+        failed = true;
+        console.log('FAIL: the picture was not let go: geometries left '
+            + `${glLive.geometry}, materials ${glLive.material}, textures ${glLive.texture}`);
+    } else {
+        console.log(`The picture is built and let go: geometries ${glMade.geometry},`
+            + ` materials ${glMade.material}: OK`);
+    }
+}
 
 // --- adding to the open project. The same model goes into a project that
 // already has folders, a texture and animations of its own, and has to leave
@@ -1071,7 +1772,7 @@ console.log('=== adding to the open project');
 	// wait in runImport: what was queued behind it has to run before looking.
 	const settle = () => new Promise(r => setTimeout(r, 100));
 	const verdict = (label, bad) => {
-		if (bad.length) { failed = true; console.log(`❌ ${label}: ${bad.join('; ')}`); }
+		if (bad.length) { failed = true; console.log(`FAIL: ${label}: ${bad.join('; ')}`); }
 		else console.log(`${label}: OK`);
 	};
 
@@ -1088,9 +1789,8 @@ console.log('=== adding to the open project');
 		await settle();
 		await settle();
 		const bad = [];
-		const form = formsShown[DIALOG] || {};
-		if (!form.add_to_open) bad.push('the dialog does not offer it');
-		if (!String((form.about_open || {}).text).includes('“arm”')) bad.push('the dialog does not name the folder');
+		if (!windowOffered.adding) bad.push('the window does not offer it');
+		if (!String(windowOffered.aboutAdding).includes('“arm”')) bad.push('the window does not name the folder');
 		if (projectsMade.length !== made) bad.push('a new project was made');
 
 		const plan = lib.texturePlan('beside', [64, 64], atlasPNG);
@@ -1220,8 +1920,14 @@ console.log('=== adding to the open project');
 		formOverride = { add_to_open: true };
 		created.cubes.length = 0;
 		reportShown = null;
+		importWindow = null;
+		// The refusal comes from the building, not from the window: the window reads
+		// the model and takes the setting, and only the build sees that the project
+		// texture has layers. So the window is worked through as usual, and the wait
+		// is for what the build says.
 		importAction.click();
-		await new Promise(r => setTimeout(r, 300));
+		await driveImportWindow();
+		await until(() => reportShown, 15000);
 		const bad = [];
 		if (created.cubes.length) bad.push(`${created.cubes.length} cubes were made`);
 		if (undoLog.length) bad.push('an undo step was opened');
@@ -1234,10 +1940,13 @@ console.log('=== adding to the open project');
 	{
 		open({ format: 'skin', uv: [64, 64], texture: {} });
 		formOverride = {};
-		delete formsShown[DIALOG];
+		importWindow = null;
+		windowOffered = {};
+		// Left standing on purpose: the question is what the window holds out, and
+		// building a skin project is not asked for here.
 		importAction.click();
-		await new Promise(r => setTimeout(r, 300));
-		verdict('A skin project: not offered', (formsShown[DIALOG] || {}).add_to_open ? ['the dialog offers it'] : []);
+		await driveImportWindow({ confirm: false });
+		verdict('A skin project: not offered', windowOffered.adding ? ['the window offers it'] : []);
 	}
 
 	openProject.groups = [];
@@ -1262,15 +1971,26 @@ console.log('--- export to CPM');
 const cpmAction = sandboxActions.find(a => a.id.endsWith('_cpm'));
 if (!cpmAction) {
 	failed = true;
-	console.log('❌ the CPM export action was not found');
+	console.log('FAIL: the CPM export action was not found');
 } else {
 	try {
+		importWindow = null;
+		windowOffered = {};
+		zipWritten = null;
 		cpmAction.click();
-		await new Promise(r => setTimeout(r, 500));
+		await driveImportWindow();
+		// The archive is assembled at the end of the whole run, through the CPM dialog:
+		// waited out by the archive and not by the clock.
+		await until(() => zipWritten, 60000);
 		// The CPM export always builds a project of its own, even with one open.
-		if ((formsShown.gltf_to_minecraft_import_dialog || {}).add_to_open) {
+		if (windowOffered.adding) {
 			failed = true;
-			console.log('❌ the CPM export offers adding to the open project');
+			console.log('FAIL: the CPM export offers adding to the open project');
+		}
+		// Cubes, not meshes: a mesh has no box, and CPM is boxes and their sizes.
+		if (windowOffered.shapes) {
+			failed = true;
+			console.log('FAIL: the CPM export offers meshes, which it cannot export');
 		}
 		// The bones asked about start at the top of the tidied tree. They used to
 		// start at the file's own top — the export wrapper, or a pass-through node
@@ -1278,8 +1998,8 @@ if (!cpmAction) {
 		const cpmForm = formsShown[Object.keys(formsShown).find(k => k.endsWith('_cpm_dialog'))] || {};
 		const asked = Object.entries(cpmForm).filter(([k]) => k.startsWith('b_')).map(([, v]) => v.label);
 		const noise = asked.filter(l => /^(node_\d+|sketchfab_model|root|gltf_scenerootnode|_?gltfnode_\d+)$/i.test(l));
-		if (!asked.length) { failed = true; console.log('❌ the CPM dialog asked about no bones'); }
-		else if (noise.length) { failed = true; console.log('❌ the CPM dialog asks about pass-through nodes: ' + noise.join(', ')); }
+		if (!asked.length) { failed = true; console.log('FAIL: the CPM dialog asked about no bones'); }
+		else if (noise.length) { failed = true; console.log('FAIL: the CPM dialog asks about pass-through nodes: ' + noise.join(', ')); }
 		else console.log(`CPM dialog asks about ${asked.length} bones, none of them pass-through: OK`);
 	} catch (e) {
 		failed = true;
@@ -1288,10 +2008,10 @@ if (!cpmAction) {
 	}
 	if (!zipWritten) {
 		failed = true;
-		console.log('❌ the .cpmproject archive was not assembled');
+		console.log('FAIL: the .cpmproject archive was not assembled');
 	} else if (!zipWritten['config.json']) {
 		failed = true;
-		console.log('❌ the archive has no config.json');
+		console.log('FAIL: the archive has no config.json');
 	} else {
 		const cfg = JSON.parse(zipWritten['config.json']);
 		const roots = cfg.elements.map(e => e.id).join(', ');
@@ -1306,15 +2026,15 @@ if (!cpmAction) {
 		console.log(`Files in the archive: ${Object.keys(zipWritten).filter(n => !n.startsWith('animations/')).join(', ')}`
 			+ ` + animations ${animNames.length}`);
 		console.log(`Elements with geometry: ${boxes}, UV grid ${cfg.skinSize.x}×${cfg.skinSize.y}`);
-		if (!boxes) { failed = true; console.log('❌ not a single box in the CPM project'); }
+		if (!boxes) { failed = true; console.log('FAIL: not a single box in the CPM project'); }
 		if (!animNames.length) {
 			failed = true;
-			console.log('❌ not a single animation was transferred');
+			console.log('FAIL: not a single animation was transferred');
 		} else {
 			// The file name is not decoration: by its prefix the loader decides whether it is a pose
 			// or a gesture, and by the rest — which pose exactly.
 			const bad = animNames.filter(n => !/^animations\/[vcg]_[^/]+\.json$/.test(n));
-			if (bad.length) { failed = true; console.log('❌ animation names do not follow the format: ' + bad.slice(0, 3).join(', ')); }
+			if (bad.length) { failed = true; console.log('FAIL: animation names do not follow the format: ' + bad.slice(0, 3).join(', ')); }
 			const one = JSON.parse(zipWritten[animNames[0]]);
 			const comps = one.frames.reduce((s, f) => s + f.components.length, 0);
 			console.log(`First animation: ${animNames[0].replace('animations/', '')}, `
@@ -1323,13 +2043,13 @@ if (!cpmAction) {
 			const collect = l => (l || []).forEach(e => { ids.add(e.storeID); collect(e.children); });
 			cfg.elements.forEach(r => collect(r.children));
 			const orphan = one.frames.some(f => f.components.some(c => !ids.has(c.storeID)));
-			if (orphan) { failed = true; console.log('❌ a keyframe refers to a storeID the model does not have'); }
+			if (orphan) { failed = true; console.log('FAIL: a keyframe refers to a storeID the model does not have'); }
 		}
-		if (cfg.version !== 1) { failed = true; console.log('❌ version is not 1'); }
-		if (!zipWritten['skin.png']) { failed = true; console.log('❌ the archive has no skin.png'); }
+		if (cfg.version !== 1) { failed = true; console.log('FAIL: version is not 1'); }
+		if (!zipWritten['skin.png']) { failed = true; console.log('FAIL: the archive has no skin.png'); }
 		if (!exported || exported.extensions[0] !== 'cpmproject') {
 			failed = true;
-			console.log('❌ Blockbench.export was not called with the cpmproject extension');
+			console.log('FAIL: Blockbench.export was not called with the cpmproject extension');
 		}
 	}
 }
@@ -1343,8 +2063,12 @@ console.log('--- export to CPM, with a part rebuilt from plates');
 {
 	const cpmAction = sandboxActions.find(a => a.id.endsWith('_cpm'));
 	const canvasesBefore = canvasLog.length;
+	importWindow = null;
 	cpmAction.click();
-	for (let i = 0; i < 100 && !zipWritten; i++) await new Promise(r => setTimeout(r, 100));
+	await driveImportWindow();
+	// Longer than the plain export: the prism is rebuilt from plates first, and that
+	// rebuild gives way to the interface between parts.
+	await until(() => zipWritten, 120000);
 	const bad = [];
 	if (!zipWritten || !zipWritten['config.json']) bad.push('no .cpmproject was assembled');
 	else {
@@ -1360,79 +2084,184 @@ console.log('--- export to CPM, with a part rebuilt from plates');
 	}
 	const skinCanvas = canvasLog.slice(canvasesBefore).some(c => c.puts > 0);
 	if (!skinCanvas) bad.push('the skin was drawn without the baked sheets');
-	if (bad.length) { failed = true; console.log('❌ ' + bad.join('; ')); }
+	if (bad.length) { failed = true; console.log('FAIL: ' + bad.join('; ')); }
 	else console.log('The prism\'s plates went into the CPM project, and the skin was drawn with their sheets: OK');
 }
 scenario = 'png';
 
-// Without the GeckoLib format, choosing GeckoLib stops the import and names the
-// plugin to install. GeckoLib Animation Utils stops at Blockbench 5.0 and GeckoLib
-// Models & Animations starts there; the message used to name only the old one,
-// which Blockbench 5 refuses to install. The catalog entry that installs on this
-// build is the one named.
+// Where the GeckoLib plugin is not installed, nothing stops any more: the format
+// is this plugin's to register, so the window offers GeckoLib as it always did, the
+// project is built, and the geometry leaves through an export of ours — which steps
+// aside the moment theirs is in the editor. What used to be checked here was the
+// opposite: a dialog naming the plugin to install, and a fall back to Bedrock. Both
+// are gone, together with the two catalog ids that dialog opened.
+//
+// Blockbench's codecs are stubbed for this section alone, because the sandbox has
+// none. What is checked is which of them the plugin reaches for and what it hands
+// the file writer; what they actually write is measured in a live editor by
+// tools/verify-geckolib-format.mjs, and nothing here stands in for that.
 console.log('');
-console.log('--- GeckoLib missing');
+console.log('--- GeckoLib without their plugin');
 {
 	const savedFormats = sandbox.Formats;
-	const savedOlder = sandbox.Blockbench.isOlderThan;
-	const { geckolib_model, ...others } = ALL_FORMATS;
-	void geckolib_model;
+	const { geckolib_model: theirs, ...others } = ALL_FORMATS;
 	sandbox.Formats = others;
+	// The codecs are the ones the sandbox has had all along, counted rather than
+	// replaced: the plugin wrapped this very animation reader when it loaded, and a
+	// fresh codec here would quietly take that wrapping out of the measurement.
+	let compiled = 0;
+	sandbox.Codecs.bedrock.compile = () => { compiled++; return '{"format_version":"1.12.0"}'; };
 
-	// Nothing chosen before: the dialog offers Bedrock, which ships with Blockbench.
+	// Nothing chosen before: the window offers GeckoLib, and the import builds into
+	// the format this plugin registered for it.
 	sandbox.localStorage._v = {};
 	lastDialog = null;
+	importWindow = null;
+	reportShown = null;
+	formOverride = {};
 	importAction.click();
-	await new Promise(r => setTimeout(r, 300));
+	// The format is left as the window set it: what is checked here is what the
+	// window chooses on its own when nothing was chosen before.
+	await driveImportWindow();
+	await until(() => reportShown, 60000);
 	const made = projectsMade[projectsMade.length - 1];
-	// The import report is a dialog too; only the GeckoLib message counts here.
-	const asked = !!lastDialog && String(lastDialog.id).endsWith('_need_geckolib');
-	if (made !== 'bedrock' || asked) {
-		failed = true;
-		console.log(`❌ without GeckoLib the default built ${made}${asked ? ' and still asked for GeckoLib' : ''}`);
-	} else {
-		console.log('No GeckoLib, nothing chosen before: builds into Bedrock: OK');
+	const ours = sandbox.Formats.geckolib_model;
+	{
+		const bad = [];
+		if (windowOffered.target !== 'geckolib_model') bad.push(`the window offers ${windowOffered.target || 'nothing'}`);
+		if (made !== 'geckolib_model') bad.push(`the import built ${made} instead`);
+		if (!ours) bad.push('the format was never registered');
+		else {
+			// The flags are the ones read off their own registration; the whole set and
+			// where it came from is written down in docs/geckolib-dependency.md.
+			const off = ['box_uv', 'single_texture', 'bone_rig', 'centered_grid', 'rotate_cubes',
+				'locators', 'animation_files', 'animation_mode'].filter(f => !ours[f]);
+			if (off.length) bad.push(`registered without ${off.join(', ')}`);
+			// The one flag deliberately set against theirs: this registration stands in
+			// for a plugin that is not there, and a tile would invite people into it.
+			if (ours.show_on_start_screen) bad.push('registered onto the start screen');
+			if (ours.codec !== sandbox.Codecs.project) bad.push('the project is not written by Blockbench\'s own codec');
+			if (ours.animation_codec !== animationCodec) bad.push('the animations are not written by the Bedrock codec');
+		}
+		if (bad.length) { failed = true; console.log('FAIL: ' + bad.join('; ')); }
+		else console.log('No GeckoLib plugin: the format is ours, and the import builds into it: OK');
 	}
 
-	formOverride = { target: 'geckolib_model' };
-	const entry = (id, verdict, extra) => Object.assign(
-		{ id, title: id, installed: false, disabled: false, isInstallable: () => verdict }, extra);
-	const cases = [
-		{ label: 'Blockbench 5', older: false, want: 'GeckoLib Models & Animations', pick: 'geckolib',
-			all: [entry('geckolib', true), entry('animation_utils', 'outdated_plugin')] },
-		{ label: 'Blockbench 4', older: true, want: 'GeckoLib Animation Utils', pick: 'animation_utils',
-			all: [entry('geckolib', 'outdated_client'), entry('animation_utils', true)] },
-		{ label: 'no catalog, Blockbench 5', older: false, want: 'GeckoLib Models & Animations', pick: null,
-			all: [] },
-		{ label: 'installed but disabled', older: false, want: 'disabled', pick: 'geckolib',
-			all: [entry('geckolib', true, { installed: true, disabled: true }), entry('animation_utils', 'outdated_plugin')] },
-	];
-	for (const c of cases) {
-		let selected = null;
-		sandbox.Blockbench.isOlderThan = () => c.older;
-		sandbox.Plugins = {
-			all: c.all,
-			dialog: { show() { }, content_vue: { selectPlugin(p) { selected = p.id; }, setTab() { } } },
-		};
-		lastDialog = null;
-		reportShown = '';
-		importAction.click();
-		const text = reportShown;
-		const wrongName = c.label !== 'Blockbench 4' && text.includes('Animation Utils');
-		if (lastDialog) lastDialog.onConfirm();
+	// The geometry: with their plugin away, File > Export offers this project nothing,
+	// so the export is ours. Measured in a live editor, hence the entry.
+	{
+		const geo = sandboxActions.find(a => a.id.endsWith('_geo'));
+		const put = sandboxActions.find(a => a.id.endsWith('_put'));
 		const bad = [];
-		if (!lastDialog) bad.push('no dialog');
-		if (!text.includes(c.want)) bad.push(`does not say "${c.want}"`);
-		if (wrongName) bad.push('names the plugin Blockbench 5 will not install');
-		if (selected !== c.pick) bad.push(`opened the list on ${selected || 'nothing'} instead of ${c.pick || 'nothing'}`);
-		if (bad.length) { failed = true; console.log(`❌ ${c.label}: ${bad.join('; ')}`); }
-		else console.log(`${c.label}: names ${c.want}${c.pick ? ', opens its page' : ''}: OK`);
+		if (!geo) bad.push('there is no geometry export');
+		else {
+			if (put && menuPlacement[geo.id] !== menuPlacement[put.id]) {
+				bad.push(`it sits in ${menuPlacement[geo.id]}, away from the project's other ways out`);
+			}
+			if (!geo.condition()) bad.push('it is hidden where nothing else can write the geometry');
+			exported = null;
+			compiled = 0;
+			geo.click();
+			if (!exported) bad.push('it wrote nothing');
+			else {
+				// The mod looks for `.geo.json`, not for a `.json`.
+				if (!/\.geo$/.test(String(exported.name))) bad.push(`the file is called ${exported.name}`);
+				if (String((exported.extensions || [])[0]) !== 'json') bad.push('the extension is not json');
+				if (exported.savetype !== 'text') bad.push('it is not written out as text');
+				if (compiled !== 1) bad.push('the geometry did not come from the Bedrock codec');
+			}
+			// Their own export in the editor: two entries writing the same file into the
+			// same menu would be worse than one, so ours goes away.
+			sandbox.BarItems = { export_geckolib_model: { id: 'export_geckolib_model' } };
+			if (geo.condition()) bad.push('it stays beside theirs, with nothing to tell the two apart');
+			delete sandbox.BarItems;
+		}
+		if (bad.length) { failed = true; console.log('FAIL: ' + bad.join('; ')); }
+		else console.log('The geometry export writes a .geo.json, and stands aside for theirs: OK');
 	}
+
+	// Their keyframes, where their plugin is not there to read them. Their shape is
+	// `{"vector": […]}`, and the editor's own reader has no branch for it: read off the
+	// real web bundle, such a value yields no data points, and the keyframe keeps its
+	// time and takes the default value. So the plugin takes the wrapper off before the
+	// reader sees the file — and what is measured here is what reached the reader, plus
+	// the two cases where the file must arrive exactly as it was written.
+	{
+		const theirFile = () => ({
+			content: JSON.stringify({
+				format_version: '1.8.0',
+				animations: {
+					probe: {
+						bones: {
+							bone: {
+								rotation: {
+									'0.0': { vector: [0, 0, 0], easing: 'easeInSine' },
+									'0.5': { vector: [0, -45, 0] },
+								},
+								position: { '0.0': { pre: { vector: [1, 2, 3] }, post: { vector: [4, 5, 6] } } },
+							},
+						},
+					},
+				},
+			}),
+		});
+		const codec = sandbox.Codecs.bedrock.format.animation_codec;
+		// Untouched, the reader is handed the text it was given; unwrapped, it is handed
+		// an object. So what arrived says by its own type whether the plugin stepped in.
+		const read = file => { animationsRead.length = 0; codec.loadFile(file); return animationsRead[0]; };
+		const bad = [];
+		const got = read(theirFile());
+		const turn = got && typeof got === 'object' && got.animations
+			&& got.animations.probe.bones.bone.rotation;
+		if (!turn) bad.push(`the reader was handed ${typeof got === 'string' ? 'the wrapper, untouched' : 'nothing'}`);
+		else {
+			if (!Array.isArray(turn['0.0'])) bad.push(`the keyframe arrived as ${JSON.stringify(turn['0.0'])}`);
+			else if (turn['0.0'].join() !== '0,0,0' || turn['0.5'].join() !== '0,-45,0') {
+				bad.push(`the values changed on the way: ${JSON.stringify([turn['0.0'], turn['0.5']])}`);
+			}
+			const move = got.animations.probe.bones.bone.position['0.0'];
+			if (!move || !Array.isArray(move.pre) || !Array.isArray(move.post)) {
+				bad.push('a keyframe held in pre and post was left wrapped');
+			}
+		}
+		// A Bedrock project is none of our business, and neither is an editor where
+		// their plugin owns the id: in both the file has to arrive as it was written.
+		const savedFormat = sandbox.Format;
+		sandbox.Format = ALL_FORMATS.bedrock;
+		const asBedrock = read(theirFile());
+		sandbox.Format = savedFormat;
+		if (typeof asBedrock !== 'string') bad.push('a Bedrock project had its animation file rewritten');
+		const oursNow = sandbox.Formats.geckolib_model;
+		sandbox.Formats.geckolib_model = theirs;
+		const withTheirs = read(theirFile());
+		sandbox.Formats.geckolib_model = oursNow;
+		if (typeof withTheirs !== 'string') bad.push('the file was rewritten while their plugin owns the format');
+		if (bad.length) { failed = true; console.log('FAIL: ' + bad.join('; ')); }
+		else console.log('Their keyframes are unwrapped for the editor\'s own reader, and only there: OK');
+	}
+
+	// Their plugin in the editor: their format is the one the project is built in, and
+	// ours never takes the id from under it.
 	sandbox.Formats = savedFormats;
-	sandbox.Blockbench.isOlderThan = savedOlder;
-	delete sandbox.Plugins;
+	lastDialog = null;
+	importWindow = null;
+	reportShown = null;
+	formOverride = { target: 'geckolib_model' };
+	importAction.click();
+	await driveImportWindow();
+	await until(() => reportShown, 60000);
+	{
+		const bad = [];
+		if (sandbox.Formats.geckolib_model !== theirs) bad.push('ours was registered over theirs');
+		if (sandbox.Format !== theirs) bad.push('the project was built in a format of ours');
+		if (bad.length) { failed = true; console.log('FAIL: ' + bad.join('; ')); }
+		else console.log('With the GeckoLib plugin: theirs is the format the project gets: OK');
+	}
+
+	delete sandbox.Codecs;
 	formOverride = {};
 }
 
-console.log(`${String.fromCharCode(10)}${failed ? '❌ THERE ARE PROBLEMS' : '✅ THE PLUGIN RUNS WITHOUT ERRORS'}${String.fromCharCode(10)}`);
+if (loose.length) console.log(`Promises nobody caught: ${loose.length}`);
+console.log(`${String.fromCharCode(10)}${failed ? 'FAIL: THERE ARE PROBLEMS' : 'PASS: THE PLUGIN RUNS WITHOUT ERRORS'}${String.fromCharCode(10)}`);
 process.exit(failed ? 1 : 0);

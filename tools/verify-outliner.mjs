@@ -18,7 +18,7 @@ const require = createRequire(import.meta.url);
 const { tidyHierarchy, parseGLTFFiles, splitComponents, isDegenerate } = require('../plugin/gltf_to_minecraft.js');
 
 let bad = 0;
-const ok = (cond, msg) => { if (!cond) bad++; console.log(`  ${cond ? '✅' : '❌'} ${msg}`); };
+const ok = (cond, msg) => { if (!cond) bad++; console.log(`  ${cond ? 'PASS' : 'FAIL'} ${msg}`); };
 
 /** A hierarchy from [index, name, parent, wrapper?] rows. */
 const tree = rows => rows.map(([index, name, parent, wrapper]) => ({ index, name, parent, wrapper: !!wrapper }));
@@ -133,5 +133,5 @@ if (models.length) {
 	console.log(`\n(no models in ${root}: only the fixed cases were checked)`);
 }
 
-console.log(`\n${bad ? `❌ FAILED: ${bad}` : '✅ THE OUTLINER IS TIDIED WITHOUT LOSS'}\n`);
+console.log(`\n${bad ? `FAIL: FAILED: ${bad}` : 'PASS: THE OUTLINER IS TIDIED WITHOUT LOSS'}\n`);
 process.exit(bad ? 1 : 0);

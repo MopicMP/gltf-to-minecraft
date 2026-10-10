@@ -3,23 +3,6 @@
 The import report is the first place to look: every case below leaves a line in
 it. The report can be saved to a file from its window.
 
-## The import says a limit was exceeded or the hierarchy contains a cycle
-
-The importer rejects cyclic node graphs and caps work before allocating model
-data. Limits are 20,000 nodes, 256 levels of hierarchy, 40,000 node visits,
-1,000,000 entries in one accessor and 4,000,000 decoded accessor components per
-parse, including animation data.
-
-ZIPs are limited to 64 MiB compressed, 4,096 entries, 64 MiB per expanded file and
-128 MiB of expanded data in total. Download and decompression use streams; a build
-without streaming support reports an error instead of buffering an unlimited
-archive. Loose files remain available through the same picker.
-
-Textures must be no larger than 8,192 pixels on either side, with at most
-16,777,216 pixels per image and 33,554,432 pixels across the model's colour images.
-PNG scanlines must match the declared dimensions. Reduce the model or texture
-size, remove unnecessary files from the archive, or re-export a malformed model.
-
 ## The figure is black or dark where it should be skin
 
 **Cause:** the texture lost its alpha channel. A Minecraft-style figure has an
@@ -83,6 +66,48 @@ Y* in the import dialog.
 that convention. The report lists the chosen factor and the alternatives.
 **What to do:** pick another *Model size* in the dialog, or set a *Custom scale*
 under *Advanced settings*.
+
+## The import says the model, the archive or a texture is too large
+
+**Cause:** the file is valid, but bigger than the import takes. The limits keep a
+runaway file from hanging Blockbench; in practice they stop whole scenes (towns,
+cathedrals of millions of vertices), almost never a figure.
+
+| What | Limit |
+|---|---|
+| Nodes | 20,000 |
+| Hierarchy depth | 256 levels |
+| Links between nodes | 40,000 |
+| Entries in one list of model data | 1,000,000 |
+| Values of geometry and animation, all together | 4,000,000 |
+| Archive | 64 MB, 4,096 files |
+| One file, unpacked | 64 MB |
+| Archive, unpacked in all | 128 MB |
+| One colour texture | 8,192 on a side, 16,777,216 pixels |
+| Colour textures, all together | 33,554,432 pixels |
+
+- Only colour textures count. Normal and roughness maps are left out of the atlas
+  anyway, so one too large is left out without stopping the import.
+- Animations are read after the geometry and share its budget. Past it, the
+  remaining animations are dropped with a line in the report, and the model
+  itself still comes in.
+- In *Import from Sketchfab* a model whose archive is over 64 MB is marked on its
+  card, and its download is refused before it starts.
+
+**What to do:** the message names the limit and what to change: simplify the
+model or split it into parts, remove the files it does not need from the archive,
+or reduce the textures, then export it again.
+
+## The import stops on a damaged file
+
+**Cause:** the file breaks the glTF format: a node hierarchy that loops back on
+itself (*glTF node hierarchy contains a cycle*), data pointing past the end of its
+buffer, an archive cut short. The message names what is broken. Smaller damage
+does not stop the import: a broken animation channel is skipped with a line in
+the report, and a PNG the plugin cannot read is handed to Blockbench's own
+decoder.
+**What to do:** export the model again from the editor it was made in, or
+download it again.
 
 ## "This archive has no glTF model"
 

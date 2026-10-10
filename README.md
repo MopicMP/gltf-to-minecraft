@@ -1,13 +1,17 @@
-# glTF to Minecraft
+# Mosaicary
 
-A Blockbench plugin that converts **glTF models — from an archive, a folder or
-straight from Sketchfab — into cubes Minecraft can use**: GeckoLib and Bedrock
-models with bones and animations, still Java block and item models, or a
-Customizable Player Models skin.
+A Blockbench plugin that holds the **Mosaicary** catalogue of Blockbench models
+— [mosaicary.com](https://mosaicary.com) — inside the editor, and converts
+**glTF models — from an archive, a folder or straight from Sketchfab — into
+cubes Minecraft can use**: GeckoLib and Bedrock models with bones and
+animations, still Java block and item models, or a Customizable Player Models
+skin.
 
-It used to be called *GeckoLib Model Importer*. The name changed on the catalog
-maintainer's remark: it imports nothing from GeckoLib, and almost nothing in it is
-tied to GeckoLib — it is a converter from glTF, and GeckoLib is one of its outputs.
+The name has changed twice. *GeckoLib Model Importer* became *glTF to Minecraft*
+on the catalog maintainer's remark: it imports nothing from GeckoLib, and almost
+nothing in it is tied to GeckoLib. Since 0.1.4 it is *Mosaicary*, after the
+catalogue it opens — converting is no longer all it does. The id stays
+`gltf_to_minecraft`, so settings, accounts and the update address are unaffected.
 
 Minecraft cannot render arbitrary polygonal geometry. A glTF model opens fine in
 Blockbench, but every element is a `Mesh`, and the game needs `Cube`. This plugin
@@ -42,13 +46,13 @@ does that conversion, and everything around it.
 ## Installation
 
 **From the plugin list** — in Blockbench, *File → Plugins…*, the *Available* tab,
-search for **glTF to Minecraft** and press *Install*. Updates arrive the same
+search for **Mosaicary** and press *Install*. Updates arrive the same
 way. The list takes a new version a little after it appears here.
 
 **From this repository** — *File → Plugins…*, then *Load Plugin from URL* with
 
 ```
-https://raw.githubusercontent.com/MopicMP/gltf-to-minecraft/main/plugin/gltf_to_minecraft.js
+https://raw.githubusercontent.com/MopicMP/mosaicary/main/plugin/gltf_to_minecraft.js
 ```
 
 or download [`plugin/gltf_to_minecraft.js`](plugin/gltf_to_minecraft.js) and use
@@ -98,14 +102,27 @@ of 0.6 × 0.7 × 0.001 px became 0.75 × 0.75 × 0 and disappeared into the head
 
 ## Requirements
 
-Bedrock, Generic and Java models, and the CPM export, need nothing beyond
-Blockbench.
+Nothing beyond Blockbench, for any of the formats — Bedrock, Generic, Java, the
+CPM export and GeckoLib alike.
 
-The GeckoLib format comes from a plugin of its own: **GeckoLib Models &
-Animations** on Blockbench 5, **GeckoLib Animation Utils** on Blockbench 4 (it
-does not install on 5). The import dialog offers GeckoLib either way; when it is
-chosen and missing, the plugin names whichever of the two installs on your build
-and opens the plugin list on it, while the dialog stays open for another choice.
+GeckoLib used to be the exception: the format came from a plugin of its own, and
+choosing it without that plugin ended in a message about installing one. Where
+the GeckoLib plugin is not installed, this plugin now registers the format
+itself, under the same id, so the files stay exactly the ones that plugin reads
+and writes. Three things follow: the import opens an ordinary project, a
+`.bbmodel` somebody else exported from GeckoLib opens as itself instead of
+losing its format — unregistered, the editor says a plugin is needed and opens
+the file as a Generic project with neither bones nor animation files, and in the
+desktop editor that load breaks off partway — and *Export GeckoLib Geometry*, in
+File > Export, writes the
+`.geo.json` the mod reads. Animation files Blockbench writes itself, as it
+always did.
+
+Their plugin — **GeckoLib Models & Animations** on Blockbench 5, **GeckoLib
+Animation Utils** on Blockbench 4 (it does not install on 5) — is still worth
+having, for its own project settings, armour template, timeline checks and
+exports. Where it is installed it stays in charge: its format object is the one
+the registry holds, and our export entry is not shown at all.
 
 Downloading from Sketchfab needs a personal API token, available in the Sketchfab
 profile settings under *Password & API*. Searching works without one.
@@ -172,8 +189,10 @@ screen.
 | Generic Model | converting further with *File → Convert Project*, or exporting glTF/OBJ | yes |
 | Java Block/Item | resource packs | no, the model is still |
 
-The last choice is remembered. Without GeckoLib installed the dialog starts on
-Bedrock.
+The last choice is remembered; with nothing chosen yet the dialog starts on
+GeckoLib, which is what most of the models this plugin is for are made for. It
+used to start on Bedrock where the GeckoLib plugin was missing, and there is
+nothing missing any more.
 
 A **Java block or item model** has no bones and does not animate, so the model
 arrives still. It also has a box to stay in: every element within −16…32 on each
@@ -232,7 +251,7 @@ extra rotation around X and Y, and whether to transfer animations. Everything el
 **Advanced settings** checkbox — those are levers for diagnosing breakage, and
 they are best changed one at a time.
 
-**Install:** Blockbench → File → Plugins, search for *glTF to Minecraft*. A
+**Install:** Blockbench → File → Plugins, search for *Mosaicary*. A
 version from this repository installs through *Load Plugin from File* →
 [`plugin/gltf_to_minecraft.js`](plugin/gltf_to_minecraft.js).
 
@@ -256,8 +275,9 @@ arrives as cubes, with bones, textures and animations where the format has them.
 
 Import it as above and choose *GeckoLib* (Java mods) or *Bedrock Entity*
 (add-ons). The bones keep their hierarchy and animations are carried over, so the
-project can be exported from Blockbench as it is. GeckoLib needs its Blockbench
-plugin, which the dialog points to.
+project can be exported from Blockbench as it is. Neither needs another plugin:
+Bedrock Entity is Blockbench's own format, and GeckoLib's is registered by this
+plugin where the GeckoLib plugin is not installed.
 
 ### How do I make a block or item model for a resource pack from a glTF?
 
@@ -327,8 +347,10 @@ folder files. Then it builds the same model into Bedrock, Generic and Java, and
 checks the Java one against the box and its format version. It adds the model to
 open projects of every format — into a folder, beside a texture painted at twice
 its UV size, into an empty one — and refuses a layered texture. It also checks that
-every entry sits in File > Import, and what happens without GeckoLib on
-Blockbench 4 and 5. The CPM export runs after them, down the same path but saving
+every entry sits in File > Import, and what an editor without the GeckoLib plugin
+gets: the format registered by this one, the import building into it, and the
+geometry export, which steps aside where their own is installed. The CPM export
+runs after them, down the same path but saving
 a `.cpmproject`. It catches what
 `node --check` misses — reading a `const` before its declaration, typos in names,
 calls to functions that do not exist.

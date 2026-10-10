@@ -20,7 +20,7 @@ const check = (label, bytes, want) => {
 	const mime = sniffMime(bytes);
 	const ok = got && got.width === want.width && got.height === want.height && mime === want.mime;
 	if (!ok) bad++;
-	console.log(`  ${ok ? '✅' : '❌'} ${label.padEnd(28)} ${got ? got.width + '×' + got.height : 'not read'}  ${mime}`
+	console.log(`  ${ok ? 'PASS' : 'FAIL'} ${label.padEnd(28)} ${got ? got.width + '×' + got.height : 'not read'}  ${mime}`
 		+ (ok ? '' : `   expected ${want.width}×${want.height} ${want.mime}`));
 };
 
@@ -73,7 +73,7 @@ check('WebP lossy 128×96', vp8, { width: 128, height: 96, mime: 'image/webp' })
 
 // not an image at all — must return null, not random numbers
 const junk = new Uint8Array(64).fill(0x41);
-console.log(`  ${imageSize(junk) === null ? '✅' : '❌'} garbage is rejected`);
+console.log(`  ${imageSize(junk) === null ? 'PASS' : 'FAIL'} garbage is rejected`);
 if (imageSize(junk) !== null) bad++;
 
 // ---------------------------------------------------------- real files
@@ -100,10 +100,10 @@ if (!found.length) {
 		const bytes = new Uint8Array(fs.readFileSync(p));
 		const size = imageSize(bytes);
 		if (!size) bad++;
-		console.log(`  ${size ? '✅' : '❌'} ${path.basename(p).padEnd(28)} `
+		console.log(`  ${size ? 'PASS' : 'FAIL'} ${path.basename(p).padEnd(28)} `
 			+ `${size ? size.width + '×' + size.height : 'not read'}  ${sniffMime(bytes)}`);
 	}
 }
 
-console.log(bad ? `\n❌ ERRORS: ${bad}\n` : '\n✅ ALL IMAGE FORMATS ARE READ\n');
+console.log(bad ? `\nFAIL: ERRORS: ${bad}\n` : '\nPASS: ALL IMAGE FORMATS ARE READ\n');
 process.exit(bad ? 1 : 0);

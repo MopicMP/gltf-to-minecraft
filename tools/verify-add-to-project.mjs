@@ -89,5 +89,5 @@ check('the archive of the test fixture', nameSlug('model(gltf).zip') === 'model_
 check('nothing usable gives "model"', nameSlug('(((.zip') === 'model' && nameSlug('') === 'model');
 
 console.log('');
-console.log(failed ? `❌ ${failed} FAILED` : '✅ ALL PASSED');
+console.log(failed ? `FAIL: ${failed} FAILED` : 'PASS: ALL PASSED');
 process.exit(failed ? 1 : 0);

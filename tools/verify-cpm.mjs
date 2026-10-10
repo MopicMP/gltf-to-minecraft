@@ -375,6 +375,8 @@ if (worstAll > TOL) fail(`the geometry diverged: up to ${worstAll.toFixed(4)} px
 // the keyframes on their own look plausible with any sign.
 const animFiles = Object.keys(built.files).filter(n => n.startsWith('animations/'));
 let animChecked = 0, animWorst = 0, animWhere = '';
+// bones under a scale CPM can only come close to: slanted at rest, or below its floor
+let roughWorst = 0, roughWhere = '';
 {
 	const byIdx = new Map(parsed.hierarchy.map(h => [h.index, h]));
 	const chainOf = h => { const c = []; for (let n = h; n; n = n.parent >= 0 ? byIdx.get(n.parent) : null) c.unshift(n); return c; };
@@ -395,14 +397,18 @@ let animChecked = 0, animWorst = 0, animWhere = '';
 		});
 		for (const [node, el] of Object.entries(b.elemByNode)) storeOfNode.set(Number(node), el.storeID);
 	}
+	const slantedStore = new Set([...storeOfNode].filter(([node]) => built.stats.anim.slanted.has(byIdx.get(node).name)).map(([, id]) => id));
 
 	for (const name of animFiles) {
 		const data = JSON.parse(built.files[name]);
 		const src = parsed.animations.find(a => a.name === data.name);
 		if (!src || !data.frames.length) continue;
 
+		// a looping interpolator wraps the last frame into the first; a single one
+		// ends on its last frame, which then stands at the very end
+		const span = data.interpolator === 'linear_loop' ? data.frames.length : data.frames.length - 1;
 		for (let fi = 0; fi < data.frames.length; fi++) {
-			const t = src.length < 1e-6 ? 0 : (fi / data.frames.length) * src.length;
+			const t = src.length < 1e-6 || span < 1 ? 0 : (fi / span) * src.length;
 
 			// the truth: world positions of the nodes from the glTF itself
 			const at = {};
@@ -415,7 +421,7 @@ let animChecked = 0, animWorst = 0, animWhere = '';
 					m = plugin.matMul(m, plugin.matFromTRS(
 						o.translation || n.rest.translation,
 						o.rotation || n.rest.rotation,
-						n.rest.scale));
+						o.scale || n.rest.scale));
 				}
 				// exactly the way parseGLTFFiles places pivots: scale and the centring
 				// shift, otherwise the "truth" differs by a constant vector
@@ -431,28 +437,35 @@ let animChecked = 0, animWorst = 0, animWhere = '';
 				if (!at[h.index]) continue;
 				const store = storeOfNode.get(h.index);
 				if (store === undefined) continue;
-				let base = null, rot = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+				let base = null, rough = false, rot = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
 				// find the root part this bone sits under
 				for (const root of config.elements) {
 					const pivot = CPM_PARTS[root.id];
-					const found = (function seek(list, origin, R) {
+					const found = (function seek(list, origin, R, rough) {
 						for (const el of list || []) {
 							const p = apply3(R, [el.pos.x, el.pos.y, el.pos.z]);
 							// a keyframe replaces pos and rotation of the elements it touches
 							const f = frame.get(el.storeID);
 							const usePos = f ? [f.pos.x, f.pos.y, f.pos.z] : [el.pos.x, el.pos.y, el.pos.z];
 							const useRot = f ? f.rotation : el.rotation;
+							// scale comes after the turn and carries the children along;
+							// CPM never lets it fall below a hundredth
+							const s = f && f.scale ? [f.scale.x, f.scale.y, f.scale.z].map(v => Math.max(v, 0.01)) : [1, 1, 1];
 							const pp = apply3(R, usePos);
 							const o2 = [origin[0] + pp[0], origin[1] + pp[1], origin[2] + pp[2]];
-							const R2 = matMul3(R, rotZYX(useRot));
-							if (el.storeID === store) return { origin: o2, R: R2 };
-							const deeper = seek(el.children, o2, R2);
+							const R2 = matMul3(matMul3(R, rotZYX(useRot)), [[s[0], 0, 0], [0, s[1], 0], [0, 0, s[2]]]);
+							// an element's own scale leaves its pivot alone, so it only
+							// matters for what hangs below
+							if (el.storeID === store) return { origin: o2, R: R2, rough };
+							const off = f && f.scale && (Math.min(f.scale.x, f.scale.y, f.scale.z) < 0.01
+								|| (slantedStore.has(el.storeID) && Math.max(...[f.scale.x, f.scale.y, f.scale.z].map(v => Math.abs(v - 1))) > 1e-4));
+							const deeper = seek(el.children, o2, R2, rough || off);
 							if (deeper) return deeper;
 							void p;
 						}
 						return null;
-					})(root.children, [pivot[0] + root.pos.x, pivot[1] + root.pos.y, pivot[2] + root.pos.z], rot);
-					if (found) { base = found.origin; break; }
+					})(root.children, [pivot[0] + root.pos.x, pivot[1] + root.pos.y, pivot[2] + root.pos.z], rot, false);
+					if (found) { base = found.origin; rough = found.rough; break; }
 				}
 				if (!base) continue;
 				// back into source coordinates, to compare with the truth;
@@ -461,7 +474,8 @@ let animChecked = 0, animWorst = 0, animWhere = '';
 				const want = truth[h.index];
 				const err = Math.hypot(got[0] - want[0], got[1] - want[1], got[2] - want[2]);
 				animChecked++;
-				if (err > animWorst) { animWorst = err; animWhere = `${data.name}/${h.name} frame ${fi}`; }
+				if (rough) { if (err > roughWorst) { roughWorst = err; roughWhere = `${data.name}/${h.name} frame ${fi}`; } }
+				else if (err > animWorst) { animWorst = err; animWhere = `${data.name}/${h.name} frame ${fi}`; }
 			}
 		}
 	}
@@ -470,6 +484,59 @@ let animChecked = 0, animWorst = 0, animWhere = '';
 // and angles to a hundredth of a degree on an arm tens of pixels long.
 if (animChecked && animWorst > 0.05) fail(`the pose from the animation diverged: up to ${animWorst.toFixed(4)} px (${animWhere})`);
 if (!animChecked) fail('animations not checked: not a single pose was assembled');
+
+// 5. Between frames. CPM unwraps each angle on its own (RotationInterpolator) and
+// eases it in a straight line. That mends a jump of a whole turn, but not a jump
+// to the other triplet of the same rotation: all three angles then swing by 180
+// while the bone barely turns, and for one frame it spins right round. The detour
+// is how much longer the eased path is than the straight arc between two frames.
+let detourWorst = 0, detourWhere = '';
+{
+	const turnAngle = (a, b) => {
+		const d = matMul3(a.map((_, i) => a.map(r => r[i])), b);
+		return Math.acos(Math.min(1, Math.max(-1, (d[0][0] + d[1][1] + d[2][2] - 1) / 2))) * 180 / Math.PI;
+	};
+	// RotationInterpolator.applyAsDouble, primed with the last two values the way
+	// LinearLoopInterpolator.init primes it
+	const unwrap = (vals, loop) => {
+		let prev = null, mul = 0;
+		const f = v => {
+			if (prev === null) { prev = v; return v; }
+			const v1 = Math.abs(v - prev), v2 = Math.abs(360 - prev + v), v3 = Math.abs(360 + prev - v);
+			prev = v;
+			if (v1 < v2 && v1 < v3) return v + mul;
+			if (v1 > v2 && v2 < v3) { mul += 360; return v + mul; }
+			if (v1 > v3 && v2 > v3) { mul -= 360; return v + mul; }
+			return v;
+		};
+		if (loop && vals.length > 1) { f(vals[vals.length - 2]); f(vals[vals.length - 1]); }
+		return vals.map(f);
+	};
+	const toXYZ = a => ({ x: a[0], y: a[1], z: a[2] });
+	for (const name of animFiles) {
+		const data = JSON.parse(built.files[name]);
+		const n = data.frames.length;
+		if (n < 2) continue;
+		const wraps = data.interpolator === 'linear_loop';
+		for (const { storeID } of data.frames[0].components) {
+			const rots = data.frames.map(f => f.components.find(c => c.storeID === storeID).rotation);
+			const un = ['x', 'y', 'z'].map(k => unwrap(rots.map(r => r[k]), wraps));
+			for (let i = 0; i < (wraps ? n : n - 1); i++) {
+				const j = (i + 1) % n;
+				const A = un.map(u => u[i]), B = un.map(u => u[j]);
+				const RA = rotZYX(toXYZ(A)), RB = rotZYX(toXYZ(B)), arc = turnAngle(RA, RB);
+				for (const k of [0.25, 0.5, 0.75]) {
+					const Rm = rotZYX(toXYZ(A.map((v, q) => v + (B[q] - v) * k)));
+					const detour = turnAngle(RA, Rm) + turnAngle(Rm, RB) - arc;
+					if (detour > detourWorst) { detourWorst = detour; detourWhere = `${data.name} frames ${i}->${j}, arc ${arc.toFixed(1)} deg`; }
+				}
+			}
+		}
+	}
+}
+// Easing three angles in straight lines bends the path a little on its own, and
+// more so the wider the step; a swing to the other triplet costs over a hundred.
+if (detourWorst > 10) fail(`a bone swings round between frames: a detour of ${detourWorst.toFixed(1)} deg (${detourWhere})`);
 
 // ------------------------------------------------------------------- output
 
@@ -503,6 +570,8 @@ console.log(`animations:    ${built.stats.anim.animations} of ${parsed.animation
 	+ `${built.stats.anim.frames} frames, ${built.stats.anim.components} records`);
 console.log(`poses checked: ${animChecked}, worst divergence ${animWorst.toExponential(2)} px`
 	+ (animWhere ? ` (${animWhere})` : ''));
+if (roughWorst) console.log(`  under a scale CPM only comes close to (slanted at rest, or below 0.01): ${roughWorst.toExponential(2)} px (${roughWhere})`);
+console.log(`between frames: worst detour ${detourWorst.toFixed(2)} deg` + (detourWhere ? ` (${detourWhere})` : ''));
 {
 	const s = built.stats.size, kb = n => (n / 1024).toFixed(1);
 	console.log(`size in game:  ~${kb(s.total)} kB (model ${kb(s.cubes)}, animations ${kb(s.anim)}, `

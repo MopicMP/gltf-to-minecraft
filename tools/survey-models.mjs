@@ -81,7 +81,7 @@ for (const dir of models) {
 	try {
 		parsed = parseGLTFFiles(files, { scale: 16, uvWidth: 128, uvHeight: 128 });
 	} catch (e) {
-		console.log(label + '❌ parsing crashed: ' + String((e && e.message) || e).slice(0, 48));
+		console.log(label + 'FAIL: parsing crashed: ' + String((e && e.message) || e).slice(0, 48));
 		continue;
 	}
 
@@ -112,7 +112,7 @@ for (const dir of models) {
 		+ String(degen).padStart(9)
 		+ `${parsed.images.length}/${colour}/${reached.size}`.padStart(11)
 		+ String((parsed.animations || []).length).padStart(7)
-		+ (share >= 30 ? '   ⚠ a third or more — the model is not for Minecraft' : '')
-		+ (boxes === 0 ? '   ❌ not a single cube' : '')
+		+ (share >= 30 ? '   WARN: a third or more — the model is not for Minecraft' : '')
+		+ (boxes === 0 ? '   FAIL: not a single cube' : '')
 	);
 }

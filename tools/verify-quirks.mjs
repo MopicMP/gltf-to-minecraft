@@ -23,7 +23,7 @@ const require = createRequire(import.meta.url);
 const { solveBox, parseGLTFFiles, FACE_DIRS } = require('../plugin/gltf_to_minecraft.js');
 
 let bad = 0;
-const ok = (cond, msg) => { if (!cond) bad++; console.log(`  ${cond ? '✅' : '❌'} ${msg}`); };
+const ok = (cond, msg) => { if (!cond) bad++; console.log(`  ${cond ? 'PASS' : 'FAIL'} ${msg}`); };
 
 /**
  * A box as twelve triangles, the way Blockbench exports a cube: centre c, half
@@ -205,5 +205,5 @@ console.log('\n=== Outline shells: inside-out copies on a one-sided material ===
 	ok(names(p) === 'body, panel', `an open panel facing inward stays: ${names(p)}`);
 }
 
-console.log(bad ? `\n❌ ERRORS: ${bad}\n` : '\n✅ THE FILE QUIRKS ARE READ RIGHT\n');
+console.log(bad ? `\nFAIL: ERRORS: ${bad}\n` : '\nPASS: THE FILE QUIRKS ARE READ RIGHT\n');
 process.exit(bad ? 1 : 0);

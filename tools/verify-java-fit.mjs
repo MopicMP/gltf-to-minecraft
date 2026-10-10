@@ -13,7 +13,7 @@ const require = createRequire(import.meta.url);
 const { fitJavaBox, applyFit, javaFormatFor, versionBelow, JAVA_BOX } = require('../plugin/gltf_to_minecraft.js');
 
 let bad = 0;
-const ok = (cond, msg) => { if (!cond) bad++; console.log(`  ${cond ? '✅' : '❌'} ${msg}`); };
+const ok = (cond, msg) => { if (!cond) bad++; console.log(`  ${cond ? 'PASS' : 'FAIL'} ${msg}`); };
 const near = (a, b) => Math.abs(a - b) < 1e-6;
 
 /** Bounds of the boxes after the fit, inflate included, as Blockbench tests them. */
@@ -114,5 +114,5 @@ ok(versionBelow('1.9.0', '1.21.6'), '1.9.0 is below 1.21.6');
 ok(!versionBelow('26.3', '1.21.11'), '26.3 is not below 1.21.11');
 ok(!versionBelow('1.21.11', '1.21.11'), 'equal is not below');
 
-console.log(`\n${bad ? `❌ FAILED: ${bad}` : '✅ ALL CORRECT'}\n`);
+console.log(`\n${bad ? `FAIL: FAILED: ${bad}` : 'PASS: ALL CORRECT'}\n`);
 process.exit(bad ? 1 : 0);

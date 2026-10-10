@@ -21,7 +21,7 @@ const require = createRequire(import.meta.url);
 const { inflateRaw, isBlankImage, parseGLTFFiles, solveBox } = require('../plugin/gltf_to_minecraft.js');
 
 let bad = 0;
-const ok = (cond, msg) => { if (!cond) bad++; console.log(`  ${cond ? '✅' : '❌'} ${msg}`); };
+const ok = (cond, msg) => { if (!cond) bad++; console.log(`  ${cond ? 'PASS' : 'FAIL'} ${msg}`); };
 const same = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
 
 console.log('\n=== The deflate decoder against zlib ===');
@@ -209,5 +209,5 @@ const inReal = uv => uv[0] >= REAL.x - 1e-6 && uv[0] <= REAL.x + REAL.w + 1e-6 &
 	ok(parsed.objects[0].faces.every(f => f.uvs.every(inReal)) && !parsed.blank.triangles, 'a fully textured cube is untouched');
 }
 
-console.log(`\n${bad ? `❌ FAILED: ${bad}` : '✅ EVERY FACE GETS ITS OWN TEXTURE'}\n`);
+console.log(`\n${bad ? `FAIL: FAILED: ${bad}` : 'PASS: EVERY FACE GETS ITS OWN TEXTURE'}\n`);
 process.exit(bad ? 1 : 0);

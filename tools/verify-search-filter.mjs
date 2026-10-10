@@ -1,9 +1,16 @@
 /**
- * The Sketchfab results filter: show only models with a ready glTF.
+ * The Sketchfab results filter: show only models with a ready glTF, and how much of
+ * a page may be models nobody is allowed to download.
  *
  * Some models only offer the author's source (.blend, .fbx) for download — there is
  * nothing to open it with. The journal collected six such refusals in a row, and all
  * of them looked fine right up to the import attempt.
+ *
+ * The locked ones are a different matter: they cannot be imported either, but they
+ * are most of Sketchfab, and hiding them made this search look a quarter the size of
+ * the same search on Sketchfab's own site. They are listed as what they are instead,
+ * a rising share of each page (SF_LOCKED_SHARE), and these checks hold the two lists
+ * apart — nothing locked may wear an import button, nothing open may wear a lock.
  *
  * Run: node tools/verify-search-filter.mjs [--live]
  *   --live also checks the filter on real API results
@@ -11,10 +18,11 @@
  */
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
-const { hasGltfArchive, sketchfabSearchURL, cubeHint, SKETCHFAB_SORTS, sketchfabEmbedURL, sketchfabPageURL, sketchfabArchives, sketchfabCredit, sketchfabDownload } = require('../plugin/gltf_to_minecraft.js');
+const { hasGltfArchive, sketchfabSearchURL, cubeHint, SKETCHFAB_SORTS, sketchfabPageURL, sketchfabArchives, sketchfabCredit, sketchfabDownload,
+	SF_LOCKED_SHARE, SF_PAGE, mixResults, isLockedModel } = require('../plugin/gltf_to_minecraft.js');
 
 let bad = 0;
-const ok = (cond, msg) => { if (!cond) bad++; console.log(`  ${cond ? '✅' : '❌'} ${msg}`); };
+const ok = (cond, msg) => { if (!cond) bad++; console.log(`  ${cond ? 'PASS' : 'FAIL'} ${msg}`); };
 
 console.log('\n=== What counts as usable ===');
 ok(hasGltfArchive({ archives: { gltf: { size: 12345 }, source: { size: null } } }),
@@ -41,6 +49,43 @@ ok(/downloadable=true/.test(withTag) && /downloadable=true/.test(without),
 ok(/q=girl/.test(sketchfabSearchURL('girl', true)), 'the query itself is not lost');
 ok(/q=&|q=$/.test(sketchfabSearchURL('', true)), 'an empty query gives an empty q, not undefined');
 
+// The second search, for the models nobody may download. They are listed as what
+// they are, with a lock and no import: they are most of Sketchfab, and leaving them
+// out made this search look a quarter the size of the same search on Sketchfab.
+//
+// There is no asking for them. `downloadable=false` is accepted and ignored — see
+// the live section below, which is what caught it — so the locked search is the
+// plain one, and the sifting happens on the results.
+console.log('\n=== The locked half of Sketchfab ===');
+const shut = sketchfabSearchURL('girl', true, false, '', true);
+ok(!/downloadable=/.test(shut), 'the locked search asks for no download filter at all');
+ok(/downloadable=true/.test(sketchfabSearchURL('girl', true, false, '', false)),
+	'while the open one still asks for one');
+ok(/tags=blockbench/.test(shut) && /q=girl/.test(shut), 'it keeps the query and the filters');
+ok(/animated=true/.test(sketchfabSearchURL('girl', true, true, '', true)), 'Animated applies to it as well');
+ok(/sort_by=-likeCount/.test(sketchfabSearchURL('girl', true, false, '-likeCount', true)), 'so does the order');
+ok(isLockedModel({ isDownloadable: false }), 'a result that says it cannot be downloaded is locked');
+ok(!isLockedModel({ isDownloadable: true }) && !isLockedModel({}) && !isLockedModel(null),
+	'anything else is not: a missing field must not put a lock on an open model');
+
+// The mix. The share rises one step per release; whatever the step, a page holds
+// SF_PAGE cards and loses none of either list.
+console.log('\n=== Mixing the two lists into one page ===');
+ok(SF_LOCKED_SHARE > 0 && SF_LOCKED_SHARE <= 0.85, `the step is ${SF_LOCKED_SHARE}, within the measured 0.85 ceiling`);
+const want = Math.round(SF_PAGE * SF_LOCKED_SHARE);
+const openList = Array.from({ length: SF_PAGE - want }, (_, i) => ({ uid: 'o' + i, isDownloadable: true }));
+const shutList = Array.from({ length: want }, (_, i) => ({ uid: 'l' + i, isDownloadable: false }));
+const page = mixResults(openList, shutList);
+ok(page.length === SF_PAGE, `a page of ${SF_PAGE} cards, ${want} of them locked`);
+ok(page.filter(isLockedModel).length === want, 'every locked one is laid out');
+ok(new Set(page.map(m => m.uid)).size === SF_PAGE, 'and nothing is laid out twice');
+const places = page.map((m, i) => isLockedModel(m) ? i : -1).filter(i => i >= 0);
+ok(places[0] > 0, 'the page does not open with a locked card');
+const gaps = places.slice(1).map((p, i) => p - places[i]);
+ok(Math.max(...gaps) - Math.min(...gaps) <= 1, `spread evenly, not in a block (gaps ${gaps.join(',')})`);
+ok(mixResults(openList, []).length === openList.length, 'with the switch off the page is open models only');
+ok(mixResults([], shutList).length === want, 'and once the open ones run out the page is filled from the other list');
+
 // The Animated box: off by default, and independent of the tag.
 const animated = sketchfabSearchURL('girl', true, true);
 ok(/[?&]animated=true(&|$)/.test(animated), 'with Animated the request has animated=true');
@@ -63,10 +108,11 @@ ok(!/sort_by=/.test(sketchfabSearchURL('girl', true, false, '-downloadCount')), 
 ok(!/sort_by=/.test(sketchfabSearchURL('girl', true, false, 'x&tags=other')), 'nor anything smuggled in');
 ok(!SKETCHFAB_SORTS.some(o => /download/i.test(o.id + o.label)), 'no order by downloads is offered');
 
-console.log('\n=== The 3D preview ===');
+// No address for an embedded viewer is built or checked here: the catalogue forbids a
+// plugin to render somebody else's HTML, so a model is turned in the plugin's own view
+// out of the geometry it downloads. What is left to check is the page one can open.
+console.log('\n=== The model page ===');
 const UID = '0123456789abcdef0123456789abcdef';
-ok(sketchfabEmbedURL(UID) === `https://sketchfab.com/models/${UID}/embed?autostart=1&dnt=1&ui_theme=dark`, 'a model id gives the viewer address');
-ok(sketchfabEmbedURL('"><script>') === null && sketchfabEmbedURL(undefined) === null, 'anything but a model id gives no frame at all');
 ok(sketchfabPageURL({ uid: UID, viewerUrl: 'https://sketchfab.com/3d-models/none-' + UID }) === 'https://sketchfab.com/3d-models/none-' + UID, 'the page the results give is kept');
 ok(sketchfabPageURL({ uid: UID, viewerUrl: 'https://example.com/x' }) === 'https://sketchfab.com/3d-models/' + UID, 'a page elsewhere is replaced with Sketchfab\'s own');
 ok(sketchfabPageURL({ uid: 'bad' }) === null, 'no page without a model id');
@@ -139,6 +185,49 @@ if (process.argv.includes('--live')) {
 			console.log(`  second page: animated ${a2} of ${(second.results || []).length}`);
 			ok(a2 === (second.results || []).length, 'on the second page every model has an animation too');
 		}
+	} catch (e) {
+		console.log(`  network unavailable or the API changed: ${e.message}`);
+		console.log('  (not a test failure — the live check was skipped)');
+	}
+
+	// The locked search against the live API. What the plugin lays out must come back
+	// pure in both directions, or the mix would be a lie twice over: a lock on a model
+	// that downloads, and an import button on one that cannot.
+	//
+	// This section is here because it caught the opposite claim. `downloadable=false`
+	// had been read as working off a single page that happened to be locked
+	// throughout — the one page on which an honoured filter and an ignored one are
+	// indistinguishable. It is ignored, so the sifting is ours to do.
+	console.log('\n=== The locked search on real results ===');
+	try {
+		const get = async url => {
+			const r = await fetch(url);
+			if (!r.ok) throw new Error('HTTP ' + r.status);
+			return (await r.json()).results || [];
+		};
+		const plainURL = sketchfabSearchURL('', true, false, '-publishedAt', true);
+		const [free, raw, asked] = await Promise.all([
+			get(sketchfabSearchURL('', true, false, '-publishedAt', false)),
+			get(plainURL),
+			get(plainURL + '&downloadable=false'),
+		]);
+		ok(free.length > 0 && free.every(m => m.isDownloadable),
+			`downloadable=true: all ${free.length} of them can be downloaded`);
+		// The parameter is recorded, not asserted: were Sketchfab to start honouring it
+		// one day that would be good news and a cheaper request, not a broken plugin.
+		const lockedIn = list => list.filter(m => !m.isDownloadable).length;
+		console.log(`  asking downloadable=false returns ${lockedIn(asked)} locked of ${asked.length}`
+			+ `, a plain search ${lockedIn(raw)} of ${raw.length}`
+			+ ` — ${lockedIn(asked) === lockedIn(raw) && asked.length === raw.length ? 'the same, so it is ignored' : 'they differ: the filter may now work'}`);
+		const held = raw.filter(isLockedModel);
+		ok(held.length > 0, `sifted by hand, the plain search gave ${held.length} locked models of ${raw.length}`);
+		ok(held.every(m => !m.isDownloadable), 'every one of them really cannot be downloaded');
+		ok(!held.some(m => free.some(x => x.uid === m.uid)), 'and the two lists hold no model in common');
+		// Measured when this was written: 51 of 336 tagged models downloadable, 15%. A
+		// page of 24 therefore carries locked models several times over the share any
+		// step of the ladder asks for, so one fetch feeds several pages.
+		ok(held.length >= Math.round(SF_PAGE * SF_LOCKED_SHARE),
+			`one fetch covers the ${Math.round(SF_PAGE * SF_LOCKED_SHARE)} a page needs at this step`);
 	} catch (e) {
 		console.log(`  network unavailable or the API changed: ${e.message}`);
 		console.log('  (not a test failure — the live check was skipped)');
@@ -302,5 +391,5 @@ if (process.argv.includes('--live')) {
 	console.log('\n(run with --live to check the filter on real results)');
 }
 
-console.log(bad ? `\n❌ ERRORS: ${bad}\n` : '\n✅ THE RESULTS FILTER WORKS\n');
+console.log(bad ? `\nFAIL: ERRORS: ${bad}\n` : '\nPASS: THE RESULTS FILTER WORKS\n');
 process.exit(bad ? 1 : 0);

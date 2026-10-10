@@ -128,5 +128,5 @@ if (!folders.length) {
 	}
 }
 
-console.log(bad === 0 ? '\n✅ STRIPS ARE READ' : `\n❌ ${bad} checks failed`);
+console.log(bad === 0 ? '\nPASS: STRIPS ARE READ' : `\nFAIL: ${bad} checks failed`);
 process.exit(bad === 0 ? 0 : 1);

@@ -127,5 +127,5 @@ if (problems.length) {
 }
 
 const pass = okSolve === n && okShape === n && totalViolations === 0;
-console.log(`\n${pass ? '✅ ALL CLEAN — lossless conversion' : '❌ THERE ARE PROBLEMS, see above'}\n`);
+console.log(`\n${pass ? 'PASS: ALL CLEAN — lossless conversion' : 'FAIL: THERE ARE PROBLEMS, see above'}\n`);
 process.exit(pass ? 0 : 1);

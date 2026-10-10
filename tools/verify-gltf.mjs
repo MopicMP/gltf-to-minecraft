@@ -68,7 +68,7 @@ for (const variant of ['external', 'embedded', 'glb']) {
 	try {
 		parsed = parseGLTFFiles(loadDir(dir), { scale: 16, uvWidth: TEX, uvHeight: TEX });
 	} catch (e) {
-		console.log(`${variant.padEnd(9)} ❌ parsing crashed: ${e.message}`);
+		console.log(`${variant.padEnd(9)} FAIL: parsing crashed: ${e.message}`);
 		allOk = false;
 		continue;
 	}
@@ -92,7 +92,7 @@ for (const variant of ['external', 'embedded', 'glb']) {
 		if (ok) matched++; else { bad++; problems.push(`${obj.name}: differs from the reference`); }
 	}
 
-	const status = bad === 0 && matched === baseline.size ? '✅' : '❌';
+	const status = bad === 0 && matched === baseline.size ? 'PASS' : 'FAIL';
 	if (bad) allOk = false;
 	console.log(`${variant.padEnd(9)} ${status} objects ${parsed.objects.length}, matched ${matched}, differences ${bad}`
 		+ (parsed.warnings.length ? `, warnings ${parsed.warnings.length}` : '')
@@ -100,5 +100,5 @@ for (const variant of ['external', 'embedded', 'glb']) {
 	for (const p of problems.slice(0, 5)) console.log(`            ${p}`);
 }
 
-console.log(`\n${allOk ? '✅ glTF PARSING MATCHES THE REFERENCE' : '❌ THERE ARE DIFFERENCES'}\n`);
+console.log(`\n${allOk ? 'PASS: glTF PARSING MATCHES THE REFERENCE' : 'FAIL: THERE ARE DIFFERENCES'}\n`);
 process.exit(allOk ? 0 : 1);

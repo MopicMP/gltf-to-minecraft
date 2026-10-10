@@ -19,7 +19,7 @@ const { resolveCoplanar, cubeFaces, solveBox, splitComponents, parseGLTFFiles } 
 	require('../plugin/gltf_to_minecraft.js');
 
 let bad = 0;
-const ok = (cond, msg) => { if (!cond) bad++; console.log(`  ${cond ? '✅' : '❌'} ${msg}`); };
+const ok = (cond, msg) => { if (!cond) bad++; console.log(`  ${cond ? 'PASS' : 'FAIL'} ${msg}`); };
 
 /** An unrotated cube by its bounds. */
 const box = (lo, hi) => ({
@@ -163,9 +163,9 @@ if (root && fs.existsSync(root)) {
 		console.log(`  ${label.slice(0, 36).padEnd(38)} ${String(sols.length).padStart(5)} `
 			+ `${String(rotated).padStart(11)} ${String(res.pairs).padStart(5)} `
 			+ `${String(touched).padStart(8)} ${max.toFixed(3).padStart(6)}`);
-		if (max > 0.125) { bad++; console.log('    ❌ inflation exceeded half a grid step — it will show'); }
+		if (max > 0.125) { bad++; console.log('    FAIL: inflation exceeded half a grid step — it will show'); }
 	}
 }
 
-console.log(bad ? `\n❌ ERRORS: ${bad}\n` : '\n✅ COINCIDING FACES ARE SEPARATED\n');
+console.log(bad ? `\nFAIL: ERRORS: ${bad}\n` : '\nPASS: COINCIDING FACES ARE SEPARATED\n');
 process.exit(bad ? 1 : 0);

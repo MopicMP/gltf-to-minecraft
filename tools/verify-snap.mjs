@@ -21,7 +21,7 @@ const { snapGrid, snapVec, snapAngle, isIdentityBasis, snapSafely, placeCoords,
 	solveBox, splitComponents, parseGLTFFiles } = require('../plugin/gltf_to_minecraft.js');
 
 let bad = 0;
-const ok = (cond, msg) => { if (!cond) bad++; console.log(`  ${cond ? '✅' : '❌'} ${msg}`); };
+const ok = (cond, msg) => { if (!cond) bad++; console.log(`  ${cond ? 'PASS' : 'FAIL'} ${msg}`); };
 
 console.log('\n=== The snapping itself ===');
 ok(snapGrid(-4.3979) === -4.5, `-4.3979 → ${snapGrid(-4.3979)}`);
@@ -75,7 +75,7 @@ const placeOf = placeCoords;
 const root = process.argv[2];
 if (!root || !fs.existsSync(root)) {
 	console.log('\n(no model folder given — the cost of snapping was not measured)');
-	console.log(bad ? `\n❌ ERRORS: ${bad}\n` : '\n✅ GRID SNAPPING WORKS\n');
+	console.log(bad ? `\nFAIL: ERRORS: ${bad}\n` : '\nPASS: GRID SNAPPING WORKS\n');
 	process.exit(bad ? 1 : 0);
 }
 
@@ -160,8 +160,8 @@ for (const dir of dirs) {
 		}
 		return false;
 	}).length;
-	if (asym) { bad++; console.log(`  ❌ identical details diverged in size: ${asym} groups`); }
-	if (distorted) { bad++; console.log(`  ❌ the shape drifted on ${distorted} axes`); }
+	if (asym) { bad++; console.log(`  FAIL: identical details diverged in size: ${asym} groups`); }
+	if (distorted) { bad++; console.log(`  FAIL: the shape drifted on ${distorted} axes`); }
 	if (!cubes) continue;
 	const label = path.relative(root, dir).replace(/[/\\]source$/, '');
 	if (maxShift > worst) { worst = maxShift; worstLabel = label; }
@@ -174,5 +174,5 @@ console.log('');
 ok(worst <= 0.2166, `vertices nowhere moved further than half a grid step `
 	+ `(maximum ${worst.toFixed(4)} px${worstLabel ? ', ' + worstLabel : ''})`);
 
-console.log(bad ? `\n❌ ERRORS: ${bad}\n` : '\n✅ GRID SNAPPING WORKS\n');
+console.log(bad ? `\nFAIL: ERRORS: ${bad}\n` : '\nPASS: GRID SNAPPING WORKS\n');
 process.exit(bad ? 1 : 0);

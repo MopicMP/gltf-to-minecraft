@@ -17,7 +17,7 @@ const require = createRequire(import.meta.url);
 const { axisRotationOf, parseGLTFFiles } = require('../plugin/gltf_to_minecraft.js');
 
 let bad = 0;
-const ok = (cond, msg) => { if (!cond) bad++; console.log(`  ${cond ? '✅' : '❌'} ${msg}`); };
+const ok = (cond, msg) => { if (!cond) bad++; console.log(`  ${cond ? 'PASS' : 'FAIL'} ${msg}`); };
 
 // ------------------------------------------------- recognising the rotation
 
@@ -50,7 +50,7 @@ ok(withShift && withShift.matrix[12] === 0 && withShift.matrix[13] === 0 && with
 const root = process.argv[2];
 if (!root || !fs.existsSync(root)) {
 	console.log('\n(no folder with unpacked archives given — the check on real models is skipped)');
-	console.log(bad ? `\n❌ ERRORS: ${bad}\n` : '\n✅ WRAPPER PARSING IS CORRECT\n');
+	console.log(bad ? `\nFAIL: ERRORS: ${bad}\n` : '\nPASS: WRAPPER PARSING IS CORRECT\n');
 	process.exit(bad ? 1 : 0);
 }
 
@@ -95,5 +95,5 @@ for (const name of fs.readdirSync(root)) {
 	for (const x of wrapWarn) console.log(`      ${x}`);
 }
 
-console.log(bad ? `\n❌ ERRORS: ${bad}\n` : '\n✅ WRAPPER PARSING IS CORRECT\n');
+console.log(bad ? `\nFAIL: ERRORS: ${bad}\n` : '\nPASS: WRAPPER PARSING IS CORRECT\n');
 process.exit(bad ? 1 : 0);

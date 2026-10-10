@@ -19,7 +19,7 @@ const lib = require('../plugin/gltf_to_minecraft.js');
 const { ROUND, rebuildNotBoxes, shapePart, piecesAt, plateMask, plateMaskBesideStrips, solveBox, pieceFaces, decodePNG } = lib;
 
 let bad = 0;
-const ok = (cond, msg) => { if (!cond) bad++; console.log(`  ${cond ? '✅' : '❌'} ${msg}`); };
+const ok = (cond, msg) => { if (!cond) bad++; console.log(`  ${cond ? 'PASS' : 'FAIL'} ${msg}`); };
 
 // ------------------------------------------------------------ shapes
 
@@ -274,5 +274,5 @@ console.log('\n=== PNG pixels without a canvas ===');
 	ok(threw, 'sixteen bits a channel are left to the canvas');
 }
 
-console.log(bad ? `\n❌ ERRORS: ${bad}\n` : '\n✅ PARTS THAT ARE NOT BOXES ARE REBUILT\n');
+console.log(bad ? `\nFAIL: ERRORS: ${bad}\n` : '\nPASS: PARTS THAT ARE NOT BOXES ARE REBUILT\n');
 process.exit(bad ? 1 : 0);

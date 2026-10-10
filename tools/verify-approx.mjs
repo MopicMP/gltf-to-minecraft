@@ -17,7 +17,7 @@ const { boxFromBounds, triangleNormal, solveBox, splitComponents, parseGLTFFiles
 	require('../plugin/gltf_to_minecraft.js');
 
 let bad = 0;
-const ok = (cond, msg) => { if (!cond) bad++; console.log(`  ${cond ? '✅' : '❌'} ${msg}`); };
+const ok = (cond, msg) => { if (!cond) bad++; console.log(`  ${cond ? 'PASS' : 'FAIL'} ${msg}`); };
 
 // ------------------------------------------------------------ normal
 
@@ -104,5 +104,5 @@ if (root && fs.existsSync(root)) {
 	}
 }
 
-console.log(bad ? `\n❌ ERRORS: ${bad}\n` : '\n✅ APPROXIMATION LAYS UV OUT PER FACE\n');
+console.log(bad ? `\nFAIL: ERRORS: ${bad}\n` : '\nPASS: APPROXIMATION LAYS UV OUT PER FACE\n');
 process.exit(bad ? 1 : 0);
